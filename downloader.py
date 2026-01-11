@@ -705,7 +705,7 @@ class ModelDownloader:
                     'url': url,
                     'output_path': output_path,
                     'filename': Path(output_path).name,
-                    'status': 'o', #pending
+                    'status': 'pending',
                     'progress': 0,
                     'remote_size': None  # Will be filled in batch
                 })
@@ -1181,7 +1181,7 @@ class DownloaderApp(App):
             file_exists = Path(item['output_path']).exists()
 
             # Update item status if it exists but wasn't marked as such
-            if file_exists and item['status'] == 'o': #pending
+            if file_exists and item['status'] == 'pending':
                 if Path(item['output_path']).is_symlink():
                     item['status'] = 'symlinked'
                 else:
@@ -1215,7 +1215,7 @@ class DownloaderApp(App):
             # Clean status display
             status = item['status']
             status_map = {
-                'o': '',
+                'pending': '',
                 'exists': 'Exists',
                 'symlinked': 'Linked',
                 'downloading': 'Downloading',
@@ -1494,7 +1494,7 @@ class DownloaderApp(App):
             # Mark any downloading items as failed
             for item in self.downloader.download_queue:
                 if item['status'] == 'downloading':
-                    item['status'] = 'o'  # Reset to pending so user can retry
+                    item['status'] = 'pending'  # Reset to pending so user can retry
             
             self.populate_table()
     

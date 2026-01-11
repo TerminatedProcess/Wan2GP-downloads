@@ -1,6 +1,0 @@
-{
-  "hub_directory": "",
-  "bandwidth_limit_kb": 90000,
-  "wan2gp_directory": "/home/dev/work/media/WanDev/Wan2GP-main/ckpts',
-  "_comment": "Edit this file to customize downloader settings. Set hub_directory to empty string to disable hub features."
-}
