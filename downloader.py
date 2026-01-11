@@ -705,7 +705,7 @@ class ModelDownloader:
                     'url': url,
                     'output_path': output_path,
                     'filename': Path(output_path).name,
-                    'status': 'pending',
+                    'status': 'o', #pending
                     'progress': 0,
                     'remote_size': None  # Will be filled in batch
                 })
@@ -918,14 +918,14 @@ class DownloaderApp(App):
         scrollbar-color: $accent;
     }
     
-    DataTable .datatable--column-2 {
-        width: 50%;
-    }
-    
-    DataTable .datatable--column-3 {
-        width: 10%;
-        text-align: right;
-    }
+    /* Column widths: ✓, Config, Model File, Size, Source, Status, Destination */
+    DataTable .datatable--column-0 { width: 3; }
+    DataTable .datatable--column-1 { width: 18; }
+    DataTable .datatable--column-2 { width: 45; }
+    DataTable .datatable--column-3 { width: 8; text-align: right; }
+    DataTable .datatable--column-4 { width: 10; }
+    DataTable .datatable--column-5 { width: 10; }
+    DataTable .datatable--column-6 { width: 12; }
     
     DataTable > .datatable--header {
         background: $primary;
@@ -977,20 +977,21 @@ class DownloaderApp(App):
     }
 
     .filter-bar {
-        dock: top;
-        height: 3;
-        padding: 0 1;
-        background: $surface-darken-1;
+        height: 1;
+        background: $surface;
+        width: 100%;
     }
 
     #filter-input {
         width: 50;
-        margin-right: 2;
+        background: $panel;
+        color: $text;
+        border: none;
     }
 
     .filter-label {
-        padding: 1 1;
-        color: $text-muted;
+        width: 8;
+        color: $text;
     }
     """
     
@@ -1002,6 +1003,7 @@ class DownloaderApp(App):
         ("u", "unselect_all", "Unselect All"),
         ("s", "toggle_show_all", "Show All"),
         ("r", "reset_cache", "Reset Cache"),
+        ("f", "focus_filter", "Filter"),
     ]
     
     filter_text = reactive("")  # Text filter for model filename
@@ -1071,14 +1073,39 @@ class DownloaderApp(App):
             self.filter_text = event.value
             self.populate_table()
 
+    def action_focus_filter(self):
+        """Focus the filter input field"""
+        self.query_one("#filter-input", Input).focus()
+
     def setup_table(self):
         """Setup the download table"""
         table = self.query_one("#download-table", DataTable)
-        table.add_columns("✓", "Config", "Model File", "Size (GB)", "Status", "Destination")
+        table.add_columns("✓", "Config", "Model File", "Size (GB)", "Source", "Status", "Destination")
         table.cursor_type = "row"
         table.zebra_stripes = True
         table.show_cursor = True
         table.focus()
+
+    def get_item_source(self, item) -> str:
+        """Determine source for an item: 'ckpt', 'link', or 'download'"""
+        output_path = Path(item['output_path'])
+
+        # Check if file exists in ckpts folder
+        if output_path.exists() and not output_path.is_symlink():
+            return "ckpt"
+
+        # Check if already symlinked
+        if output_path.exists() and output_path.is_symlink():
+            return "link"
+
+        # Check if available in InvokeAI hub
+        if self.downloader.invokeai_enabled and item['url'].startswith('http'):
+            invokeai_path = self.downloader.find_in_invokeai(item['url'])
+            if invokeai_path:
+                return "link"
+
+        # Needs to be downloaded
+        return "download"
     
     @work(exclusive=True, thread=True)
     async def scan_hub(self):
@@ -1154,7 +1181,7 @@ class DownloaderApp(App):
             file_exists = Path(item['output_path']).exists()
 
             # Update item status if it exists but wasn't marked as such
-            if file_exists and item['status'] == 'pending':
+            if file_exists and item['status'] == 'o': #pending
                 if Path(item['output_path']).is_symlink():
                     item['status'] = 'symlinked'
                 else:
@@ -1188,8 +1215,8 @@ class DownloaderApp(App):
             # Clean status display
             status = item['status']
             status_map = {
-                'pending': 'Pending',
-                'exists': 'Exists', 
+                'o': '',
+                'exists': 'Exists',
                 'symlinked': 'Linked',
                 'downloading': 'Downloading',
                 'completed': 'Complete',
@@ -1218,12 +1245,20 @@ class DownloaderApp(App):
             # Log if size is unknown for troubleshooting (to console, not UI)
             if size_display == "Unknown":
                 logging.debug(f"Unknown size for {item['filename']}, remote_size: {item.get('remote_size')}")
-            
+
+            # Get source (ckpt, link, or download)
+            source = self.get_item_source(item)
+
+            # Truncate filename to fit column (max 43 chars + ..)
+            if len(filename) > 43:
+                filename = filename[:41] + ".."
+
             table.add_row(
                 check_mark,
                 item['config'],
                 filename,
                 size_display,
+                source,
                 status_display,
                 destination
             )
@@ -1459,7 +1494,7 @@ class DownloaderApp(App):
             # Mark any downloading items as failed
             for item in self.downloader.download_queue:
                 if item['status'] == 'downloading':
-                    item['status'] = 'pending'  # Reset to pending so user can retry
+                    item['status'] = 'o'  # Reset to pending so user can retry
             
             self.populate_table()
     
