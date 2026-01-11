@@ -7,6 +7,7 @@ Stable terminal interface that won't get corrupted
 import os
 import sys
 import json
+import yaml
 import requests
 import httpx
 import time
@@ -130,19 +131,33 @@ class BandwidthLimitedTransport(httpx.HTTPTransport):
         return response
 
 class ModelDownloader:
-    def __init__(self, hub_dir: str = None, bandwidth_limit: Optional[int] = None, cache_dir: str = None, config_file: str = "config.json"):
+    def __init__(self, hub_dir: str = None, bandwidth_limit: Optional[int] = None, cache_dir: str = None, config_file: str = "config.yaml"):
         # Load configuration from file
         self.config = self.load_config(config_file)
-        
+
         # Use parameters if provided, otherwise fall back to config, then defaults
-        self.hub_dir = Path(hub_dir) if hub_dir else Path(self.config.get("hub_directory", "/mnt/llm/hub/models"))
-        self.cache_dir = Path(cache_dir) if cache_dir else Path(self.config.get("wan2gp_directory", "../Wan2GP/ckpts"))
+        self.wan2gp_dir = Path(self.config.get("wan2gp_directory", "../Wan2GP-mryan"))
+        self.cache_dir = Path(cache_dir) if cache_dir else self.wan2gp_dir / "ckpts"
+        self.defaults_dir = self.wan2gp_dir / "defaults"
         self.bandwidth_limit = bandwidth_limit if bandwidth_limit is not None else self.config.get("bandwidth_limit_kb")
-        
-        # Check if hub directory exists and is valid
-        self.hub_enabled = self.hub_dir.exists() and self.hub_dir.is_dir()
-        if not self.hub_enabled:
-            print(f"Hub directory not found or invalid: {self.hub_dir} - Hub features disabled")
+
+        # InvokeAI integration - query existing models instead of re-downloading
+        self.invokeai_db = Path(self.config.get("invokeai_db", "")) if self.config.get("invokeai_db") else None
+        self.invokeai_models_dir = Path(self.config.get("invokeai_models_dir", "")) if self.config.get("invokeai_models_dir") else None
+        self.invokeai_enabled = (
+            self.invokeai_db is not None and
+            self.invokeai_db.exists() and
+            self.invokeai_models_dir is not None and
+            self.invokeai_models_dir.exists()
+        )
+        if self.invokeai_enabled:
+            print(f"InvokeAI integration enabled - will check for existing models")
+        elif self.invokeai_db:
+            print(f"InvokeAI database not found: {self.invokeai_db} - InvokeAI integration disabled")
+
+        # Legacy hub support (deprecated, use InvokeAI integration instead)
+        self.hub_dir = Path(hub_dir) if hub_dir else None
+        self.hub_enabled = self.hub_dir is not None and self.hub_dir.exists() and self.hub_dir.is_dir()
         
         self.hash_db = {}
         self.download_queue = []
@@ -169,19 +184,25 @@ class ModelDownloader:
                 print("Warning: Could not configure bandwidth limiting - huggingface_hub API not available")
     
     def load_config(self, config_file: str) -> dict:
-        """Load configuration from JSON file, create if missing"""
+        """Load configuration from YAML or JSON file, create if missing"""
         try:
             config_path = Path(config_file)
             if config_path.exists():
                 with open(config_path, 'r') as f:
-                    return json.load(f)
+                    if config_file.endswith('.yaml') or config_file.endswith('.yml'):
+                        return yaml.safe_load(f) or {}
+                    else:
+                        return json.load(f)
             else:
                 # Create default config file on first run
                 default_config = self.create_default_config()
                 print(f"Config file {config_file} not found, creating with defaults...")
                 try:
                     with open(config_path, 'w') as f:
-                        json.dump(default_config, f, indent=2)
+                        if config_file.endswith('.yaml') or config_file.endswith('.yml'):
+                            yaml.dump(default_config, f, default_flow_style=False)
+                        else:
+                            json.dump(default_config, f, indent=2)
                     print(f"Created {config_file} - you can edit it to customize settings")
                 except Exception as write_error:
                     print(f"Warning: Could not create config file {config_file}: {write_error}")
@@ -189,14 +210,13 @@ class ModelDownloader:
         except Exception as e:
             print(f"Error loading config file {config_file}: {e} - using defaults")
             return self.create_default_config()
-    
+
     def create_default_config(self) -> dict:
         """Create default configuration"""
         return {
-            "hub_directory": "/mnt/llm/hub/models",
+            "wan2gp_directory": "../Wan2GP-mryan",
             "bandwidth_limit_kb": 90000,
-            "wan2gp_directory": "../Wan2GP/ckpts",
-            "_comment": "Edit this file to customize downloader settings. Set hub_directory to empty string to disable hub features."
+            "hub_directory": "",
         }
     
     def init_cache_db(self):
@@ -491,11 +511,41 @@ class ModelDownloader:
         return file_info['size'] if file_info else None
     
     def find_in_hub(self, file_hash: str) -> Optional[Dict]:
-        """Find file in hub by hash"""
+        """Find file in hub by hash (legacy)"""
         if file_hash in self.hash_db:
             return self.hash_db[file_hash]
         return None
-    
+
+    def find_in_invokeai(self, url: str) -> Optional[str]:
+        """Find model in InvokeAI database by source URL, return full path if found"""
+        if not self.invokeai_enabled:
+            return None
+
+        try:
+            conn = sqlite3.connect(str(self.invokeai_db))
+            cursor = conn.cursor()
+
+            # Query for matching source URL
+            cursor.execute(
+                "SELECT path FROM models WHERE source = ?",
+                (url,)
+            )
+            result = cursor.fetchone()
+            conn.close()
+
+            if result:
+                relative_path = result[0]
+                full_path = self.invokeai_models_dir / relative_path
+                if full_path.exists():
+                    return str(full_path)
+                else:
+                    logging.debug(f"InvokeAI model path not found: {full_path}")
+            return None
+
+        except Exception as e:
+            logging.debug(f"Error querying InvokeAI database: {e}")
+            return None
+
     def create_symlink(self, source_path: str, target_path: str) -> tuple[bool, str]:
         """Create symlink from source to target"""
         try:
@@ -525,34 +575,37 @@ class ModelDownloader:
     def determine_output_path(self, url: str, url_type: str) -> str:
         """Determine the correct output path based on file type and URL"""
         filename = Path(urlparse(url).path).name
-        
+        base = str(self.wan2gp_dir)
+
         if any(pattern in filename.lower() for pattern in ['lora', 'adapter']):
             if 'flux' in filename.lower():
-                return f"../Wan2GP/loras_flux/{filename}"
+                return f"{base}/loras_flux/{filename}"
             elif 'hunyuan' in filename.lower():
-                return f"../Wan2GP/loras_hunyuan/{filename}"
+                return f"{base}/loras_hunyuan/{filename}"
             elif 'i2v' in filename.lower():
-                return f"../Wan2GP/loras_i2v/{filename}"
+                return f"{base}/loras_i2v/{filename}"
             elif 'ltxv' in filename.lower() or 'ltx' in filename.lower():
-                return f"../Wan2GP/loras_ltxv/{filename}"
+                return f"{base}/loras_ltxv/{filename}"
             elif 'qwen' in filename.lower():
-                return f"../Wan2GP/loras_qwen/{filename}"
+                return f"{base}/loras_qwen/{filename}"
             else:
-                return f"../Wan2GP/loras/{filename}"
+                return f"{base}/loras/{filename}"
         else:
-            return f"../Wan2GP/ckpts/{filename}"
+            return f"{base}/ckpts/{filename}"
     
     def resolve_config_urls(self, config_file: str) -> List[Tuple[str, str, str]]:
         """Resolve URLs from config file, handling references"""
-        def resolve_urls(urls, defaults_dir='../Wan2GP/defaults'):
+        defaults_dir = self.defaults_dir
+
+        def resolve_urls(urls):
             if isinstance(urls, str):
-                ref_file = Path(defaults_dir) / f"{urls}.json"
+                ref_file = defaults_dir / f"{urls}.json"
                 if ref_file.exists():
                     try:
                         with open(ref_file, 'r') as f:
                             ref_config = json.load(f)
                         ref_urls = ref_config.get('model', {}).get('URLs', [])
-                        return resolve_urls(ref_urls, defaults_dir)
+                        return resolve_urls(ref_urls)
                     except:
                         return []
                 return []
@@ -617,14 +670,14 @@ class ModelDownloader:
     def build_download_queue(self, progress_callback=None) -> List[Dict]:
         """Build complete download queue from all config files"""
         queue = []
-        defaults_dir = Path("../Wan2GP/defaults")
-        
-        if not defaults_dir.exists():
+
+        if not self.defaults_dir.exists():
+            print(f"Defaults directory not found: {self.defaults_dir}")
             return queue
         
         # First pass: collect all URLs and build basic queue
         url_to_cache_key = {}
-        for config_file in sorted(defaults_dir.glob("*.json")):
+        for config_file in sorted(self.defaults_dir.glob("*.json")):
             config_name = config_file.stem
             urls = self.resolve_config_urls(str(config_file))
             
@@ -749,14 +802,14 @@ class ModelDownloader:
                 else:
                     print("HuggingFace cache building complete!")
         
-        # Third pass: Check hub for missing files and auto-create symlinks
-        if self.hub_enabled:
-            print("Checking hub for existing files and creating symlinks...")
+        # Third pass: Check InvokeAI for existing models and auto-create symlinks
+        if self.invokeai_enabled:
+            print("Checking InvokeAI for existing models...")
             symlinks_created = 0
             items_checked = 0
             for item in queue:
                 output_path = Path(item['output_path'])
-                
+
                 # Skip if file already exists or is already symlinked
                 if output_path.exists():
                     if output_path.is_symlink():
@@ -764,40 +817,26 @@ class ModelDownloader:
                     else:
                         item['status'] = 'exists'
                     continue
-                
-                # Only check hub for HTTP URLs
+
+                # Only check for HTTP URLs
                 if not item['url'].startswith('http'):
                     continue
-                
-                # Get file hash from cache if available
-                repo_id, filename = self.parse_hf_url(item['url'])
-                if repo_id and filename:
-                    cache_key = f"{repo_id}/{filename}"
-                    cached_info = self.get_cached_file_info(cache_key)
-                    items_checked += 1
-                    
-                    if cached_info['found'] and cached_info['data'] and cached_info['data']['hash']:
-                        file_hash = cached_info['data']['hash']
-                        
-                        # Look for file in hub
-                        hub_file = self.find_in_hub(file_hash)
-                        if hub_file and Path(hub_file['path']).exists():
-                            # Create symlink
-                            success, msg = self.create_symlink(hub_file['path'], str(output_path))
-                            if success:
-                                item['status'] = 'symlinked'
-                                symlinks_created += 1
-                                print(f"✓ Symlinked {item['filename']} from hub")
-                            else:
-                                print(f"✗ Failed to symlink {item['filename']}: {msg}")
-                        else:
-                            print(f"  Hash {file_hash[:8]}... not found in hub for {item['filename']}")
+
+                items_checked += 1
+
+                # Query InvokeAI database for matching source URL
+                invokeai_path = self.find_in_invokeai(item['url'])
+                if invokeai_path:
+                    # Create symlink to InvokeAI model
+                    success, msg = self.create_symlink(invokeai_path, str(output_path))
+                    if success:
+                        item['status'] = 'symlinked'
+                        symlinks_created += 1
+                        print(f"✓ Symlinked {item['filename']} from InvokeAI")
                     else:
-                        print(f"  No cached hash for {item['filename']}")
-            
-            print(f"Hub check complete: {items_checked} items checked, {symlinks_created} symlinks created")
-            if symlinks_created > 0:
-                print(f"Created {symlinks_created} symlinks from hub files")
+                        print(f"✗ Failed to symlink {item['filename']}: {msg}")
+
+            print(f"InvokeAI check complete: {items_checked} URLs checked, {symlinks_created} symlinks created")
         
         return queue
     
@@ -937,7 +976,7 @@ class DownloaderApp(App):
         ("r", "reset_cache", "Reset Cache"),
     ]
     
-    def __init__(self, hub_dir: str = None, bandwidth_limit: Optional[int] = None, config_file: str = "config.json"):
+    def __init__(self, hub_dir: str = None, bandwidth_limit: Optional[int] = None, config_file: str = "config.yaml"):
         super().__init__()
         self.downloader = ModelDownloader(
             hub_dir=hub_dir,
@@ -1095,8 +1134,9 @@ class DownloaderApp(App):
         items_to_show = self.get_filtered_items()
         
         for item in items_to_show:
-            # Clean destination path
-            destination = item['output_path'].replace("../Wan2GP/", "").split("/")[0]
+            # Clean destination path - remove the wan2gp base directory prefix
+            wan2gp_prefix = str(self.downloader.wan2gp_dir) + "/"
+            destination = item['output_path'].replace(wan2gp_prefix, "").split("/")[0]
             
             # Clean status display
             status = item['status']
@@ -1426,28 +1466,21 @@ class DownloaderApp(App):
             item['status'] = 'exists'
             self.call_from_thread(self.query_one("#log", Log).write_line, f"Already exists: {filename}")
         else:
-            # Get file hash from HuggingFace and check hub if enabled
-            if self.downloader.hub_enabled:
-                file_hash = self.downloader.get_hf_file_hash(url)
-                
-                if file_hash:
-                    # Look for file in hub
-                    hub_file = self.downloader.find_in_hub(file_hash)
-                    
-                    if hub_file:
-                        # Create symlink
-                        success, msg = self.downloader.create_symlink(hub_file['path'], output_path)
-                        if success:
-                            item['status'] = 'symlinked'
-                            self.call_from_thread(self.query_one("#log", Log).write_line, f"Symlinked from hub: {filename}")
-                            # Update table and finish processing this item
-                            self.call_from_thread(self.populate_table)
-                            self.is_downloading = False
-                            return
-                        else:
-                            item['status'] = 'failed'
-                            self.call_from_thread(self.query_one("#log", Log).write_line, f"Failed to create symlink: {filename} - {msg}")
-            
+            # Check InvokeAI for existing model
+            if self.downloader.invokeai_enabled:
+                invokeai_path = self.downloader.find_in_invokeai(url)
+                if invokeai_path:
+                    success, msg = self.downloader.create_symlink(invokeai_path, output_path)
+                    if success:
+                        item['status'] = 'symlinked'
+                        self.call_from_thread(self.query_one("#log", Log).write_line, f"Symlinked from InvokeAI: {filename}")
+                        self.call_from_thread(self.populate_table)
+                        self.is_downloading = False
+                        return
+                    else:
+                        item['status'] = 'failed'
+                        self.call_from_thread(self.query_one("#log", Log).write_line, f"Failed to create symlink: {filename} - {msg}")
+
             # Download file using HuggingFace Hub
             self.call_from_thread(self.query_one("#log", Log).write_line, f"Downloading: {filename}")
             
@@ -1505,25 +1538,20 @@ class DownloaderApp(App):
                 self.call_from_thread(self.query_one("#log", Log).write_line, f"Already exists: {filename}")
                 continue
             
-            # Get file hash from HuggingFace
-            file_hash = self.downloader.get_hf_file_hash(url)
-            
-            if file_hash:
-                # Look for file in hub
-                hub_file = self.downloader.find_in_hub(file_hash)
-                
-                if hub_file:
-                    # Create symlink
-                    success = self.downloader.create_symlink(hub_file['path'], output_path)
+            # Check InvokeAI for existing model
+            if self.downloader.invokeai_enabled:
+                invokeai_path = self.downloader.find_in_invokeai(url)
+                if invokeai_path:
+                    success, msg = self.downloader.create_symlink(invokeai_path, output_path)
                     if success:
                         item['status'] = 'symlinked'
-                        self.call_from_thread(self.query_one("#log", Log).write_line, f"Symlinked from hub: {filename}")
+                        self.call_from_thread(self.query_one("#log", Log).write_line, f"Symlinked from InvokeAI: {filename}")
                         continue
-            
-            # Download file using HuggingFace Hub  
+
+            # Download file using HuggingFace Hub
             self.call_from_thread(self.query_one("#log", Log).write_line, f"Downloading: {filename}")
-            
-            success = self.downloader.download_hf_file(url, output_path, item)
+
+            success, error_msg = self.downloader.download_hf_file(url, output_path, item)
             if success:
                 item['status'] = 'completed'
                 item['progress'] = 100
@@ -1574,22 +1602,15 @@ class DownloaderApp(App):
                 self.call_from_thread(self.query_one("#log", Log).write_line, f"Already exists: {filename}")
                 continue
             
-            # Check hub if enabled
-            if self.downloader.hub_enabled:
-                # Get file hash from HuggingFace
-                file_hash = self.downloader.get_hf_file_hash(url)
-                
-                if file_hash:
-                    # Look for file in hub
-                    hub_file = self.downloader.find_in_hub(file_hash)
-                    
-                    if hub_file:
-                        # Create symlink
-                        success, msg = self.downloader.create_symlink(hub_file['path'], output_path)
-                        if success:
-                            item['status'] = 'symlinked'
-                            self.call_from_thread(self.query_one("#log", Log).write_line, f"Symlinked from hub: {filename}")
-                            continue
+            # Check InvokeAI for existing model
+            if self.downloader.invokeai_enabled:
+                invokeai_path = self.downloader.find_in_invokeai(url)
+                if invokeai_path:
+                    success, msg = self.downloader.create_symlink(invokeai_path, output_path)
+                    if success:
+                        item['status'] = 'symlinked'
+                        self.call_from_thread(self.query_one("#log", Log).write_line, f"Symlinked from InvokeAI: {filename}")
+                        continue
             
             # Download file using HuggingFace Hub  
             self.call_from_thread(self.query_one("#log", Log).write_line, f"Downloading: {filename}")
@@ -1663,19 +1684,15 @@ def download_single_file(downloader: ModelDownloader, config_name: str, filename
 @click.option('--limit', '-l', type=int, help='Bandwidth limit in KB/s')
 @click.option('--no-limit', is_flag=True, help='Download without bandwidth limits')
 @click.option('--hub-dir', help='Path to model hub directory (overrides config file)')
-@click.option('--config-file', default='config.json', help='Path to configuration file')
+@click.option('--config-file', default='config.yaml', help='Path to configuration file')
 @click.option('--config', help='Download specific config (e.g. fun_inp)')
 @click.option('--file', help='Download specific file pattern (e.g. Fun_InP)')
 @click.option('--cli', is_flag=True, help='Use CLI mode instead of TUI')
 def main(limit, no_limit, hub_dir, config_file, config, file, cli):
     """WanGP Smart Model Downloader with Textual UI or CLI mode"""
-    
+
     bandwidth_limit = None if no_limit else limit
-    
-    if not Path("../Wan2GP/wgp.py").exists():
-        print("Error: Please run this script from the Wan2GP_model_download directory next to WanGP")
-        sys.exit(1)
-    
+
     # CLI mode for direct downloads
     if cli or (config and file):
         print("WanGP Model Downloader - CLI Mode")
@@ -1687,11 +1704,8 @@ def main(limit, no_limit, hub_dir, config_file, config, file, cli):
         )
         
         print(f"Bandwidth limit: {downloader.bandwidth_limit or 'unlimited'} KB/s")
-        print(f"Hub directory: {downloader.hub_dir} ({'enabled' if downloader.hub_enabled else 'disabled'})")
-        print(f"Wan2GP directory: {downloader.cache_dir}")
-        
-        print("Scanning hub...")
-        downloader.scan_hub()
+        print(f"InvokeAI integration: {'enabled' if downloader.invokeai_enabled else 'disabled'}")
+        print(f"Wan2GP directory: {downloader.wan2gp_dir}")
         
         print("Building download queue...")
         downloader.download_queue = downloader.build_download_queue()

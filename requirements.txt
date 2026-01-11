@@ -3,4 +3,5 @@ httpx>=0.24.0
 textual>=0.41.0
 click>=8.0.0
 huggingface_hub>=0.20.0
+pyyaml>=6.0
 
