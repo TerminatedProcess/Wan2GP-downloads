@@ -33,7 +33,7 @@ except ImportError:
 import click
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
-from textual.widgets import Header, Footer, DataTable, Static, ProgressBar, Log
+from textual.widgets import Header, Footer, DataTable, Static, ProgressBar, Log, Input
 from textual.reactive import reactive
 from textual import work, events
 from textual.worker import get_current_worker
@@ -517,7 +517,7 @@ class ModelDownloader:
         return None
 
     def find_in_invokeai(self, url: str) -> Optional[str]:
-        """Find model in InvokeAI database by source URL, return full path if found"""
+        """Find model in InvokeAI database by source URL or filename, return full path if found"""
         if not self.invokeai_enabled:
             return None
 
@@ -525,12 +525,23 @@ class ModelDownloader:
             conn = sqlite3.connect(str(self.invokeai_db))
             cursor = conn.cursor()
 
-            # Query for matching source URL
+            # First try: exact URL match
             cursor.execute(
                 "SELECT path FROM models WHERE source = ?",
                 (url,)
             )
             result = cursor.fetchone()
+
+            # Second try: match by filename (for locally imported models)
+            if not result:
+                filename = Path(urlparse(url).path).name
+                # Match where source ends with the same filename
+                cursor.execute(
+                    "SELECT path FROM models WHERE source LIKE ?",
+                    (f"%/{filename}",)
+                )
+                result = cursor.fetchone()
+
             conn.close()
 
             if result:
@@ -964,6 +975,23 @@ class DownloaderApp(App):
         scrollbar-background: $panel;
         scrollbar-color: $accent;
     }
+
+    .filter-bar {
+        dock: top;
+        height: 3;
+        padding: 0 1;
+        background: $surface-darken-1;
+    }
+
+    #filter-input {
+        width: 50;
+        margin-right: 2;
+    }
+
+    .filter-label {
+        padding: 1 1;
+        color: $text-muted;
+    }
     """
     
     BINDINGS = [
@@ -976,6 +1004,8 @@ class DownloaderApp(App):
         ("r", "reset_cache", "Reset Cache"),
     ]
     
+    filter_text = reactive("")  # Text filter for model filename
+
     def __init__(self, hub_dir: str = None, bandwidth_limit: Optional[int] = None, config_file: str = "config.yaml"):
         super().__init__()
         self.downloader = ModelDownloader(
@@ -1003,13 +1033,18 @@ class DownloaderApp(App):
         
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True, name="WanGP Model Downloader")
-        
+
         # Top status message area
         with Horizontal(classes="status-messages"):
             yield Static("Ready - Use hotkeys below for actions", id="main-status", classes="main-status")
             yield ProgressBar(id="progress-bar", classes="progress-bar")
             yield Static("", id="progress-info", classes="progress-info")
-        
+
+        # Filter bar
+        with Horizontal(classes="filter-bar"):
+            yield Static("Filter:", classes="filter-label")
+            yield Input(placeholder="Type to filter by model name...", id="filter-input")
+
         # Main data table
         yield DataTable(id="download-table")
         
@@ -1026,10 +1061,16 @@ class DownloaderApp(App):
         main_status = self.query_one("#main-status", Static)
         main_status.update("Initializing...")
         logging.debug("Widget updated to 'Initializing...' (on_mount)")
-        
+
         self.setup_table()
         self.scan_hub()
-    
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Handle filter input changes"""
+        if event.input.id == "filter-input":
+            self.filter_text = event.value
+            self.populate_table()
+
     def setup_table(self):
         """Setup the download table"""
         table = self.query_one("#download-table", DataTable)
@@ -1106,20 +1147,26 @@ class DownloaderApp(App):
     def get_filtered_items(self):
         """Get filtered items based on current filter settings"""
         items_to_show = []
+        filter_lower = self.filter_text.lower().strip()
+
         for item in self.downloader.download_queue:
             # Check if file exists
             file_exists = Path(item['output_path']).exists()
-            
+
             # Update item status if it exists but wasn't marked as such
             if file_exists and item['status'] == 'pending':
                 if Path(item['output_path']).is_symlink():
                     item['status'] = 'symlinked'
                 else:
                     item['status'] = 'exists'
-            
+
             # Consider files with these statuses as "existing"
             considered_existing = item['status'] in ['exists', 'symlinked', 'completed']
-            
+
+            # Text filter - match against filename
+            if filter_lower and filter_lower not in item['filename'].lower():
+                continue
+
             # Filter logic: show all files OR show only non-existing files
             if self.show_all_files or not considered_existing:
                 items_to_show.append(item)

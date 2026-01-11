@@ -75,19 +75,21 @@ invokeai_models_dir: /mnt/llm/hub/invokeai_data/models
 
 ### InvokeAI Integration
 
-The downloader queries InvokeAI's SQLite database to find existing models by matching HuggingFace URLs. If a model exists in InvokeAI, a symlink is created instead of downloading.
+The downloader queries InvokeAI's SQLite database to find existing models. If a model exists in InvokeAI, a symlink is created instead of downloading.
 
-- Matches by `source` URL in InvokeAI's `models` table
+- First tries exact `source` URL match in InvokeAI's `models` table
+- Falls back to filename matching (for locally imported models)
 - Creates symlinks from `invokeai_models_dir/{uuid}/model.safetensors` to Wan2GP's `ckpts/`
-- No hash comparison needed - direct URL matching
 
-### TUI Hotkeys
-- `Enter`: Toggle selection on current row
-- `d`: Download selected models
-- `a`/`u`: Select/unselect all
-- `s`: Toggle show all vs missing only
-- `r`: Reset HuggingFace cache
-- `Escape`: Abort downloads or quit
+### TUI Features
+- **Filter bar**: Type to filter models by filename (real-time filtering)
+- **Hotkeys**:
+  - `Enter`: Toggle selection on current row
+  - `d`: Download selected models
+  - `a`/`u`: Select/unselect all
+  - `s`: Toggle show all vs missing only
+  - `r`: Reset HuggingFace cache
+  - `Escape`: Abort downloads or quit
 
 ## Dependencies
 
