@@ -1109,7 +1109,7 @@ class DownloaderApp(App):
 
         # Filter bar
         with Horizontal(classes="filter-bar"):
-            yield Static("Filter:", classes="filter-label")
+            yield Static("Search:", classes="filter-label")
             yield Input(placeholder="Type to filter by model name...", id="filter-input")
 
         # Main data table
