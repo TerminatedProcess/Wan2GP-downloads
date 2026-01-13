@@ -895,28 +895,33 @@ class ModelDownloader:
             # Poll progress while downloading
             if progress_callback and expected_size > 0:
                 start_time = time.time()
-                # Find the incomplete file in HF cache to track progress
                 cache_path = Path(self.cache_dir)
+                last_size = 0
 
                 while not download_done.is_set():
-                    # Look for incomplete download files (.incomplete)
+                    # Find the most recently modified .incomplete file (active download)
                     incomplete_files = list(cache_path.rglob("*.incomplete"))
-                    current_size = 0
 
-                    for incomplete in incomplete_files:
-                        if filename.replace('/', '_') in str(incomplete) or filename.split('/')[-1] in str(incomplete):
-                            try:
-                                current_size = incomplete.stat().st_size
-                                break
-                            except (FileNotFoundError, OSError):
-                                pass
+                    # Sort by modification time, most recent first
+                    if incomplete_files:
+                        incomplete_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
-                    if current_size > 0:
-                        elapsed = time.time() - start_time
-                        speed = current_size / elapsed if elapsed > 0 else 0
-                        speed_mb = speed / (1024 * 1024)
-                        percent = (current_size / expected_size) * 100 if expected_size > 0 else 0
-                        progress_callback(current_size, expected_size, min(percent, 99.9), speed_mb)
+                        # Use the most recently modified incomplete file
+                        active_file = incomplete_files[0]
+
+                        try:
+                            current_size = active_file.stat().st_size
+
+                            # Only update if size is growing (confirms it's the right file)
+                            if current_size > last_size:
+                                last_size = current_size
+                                elapsed = time.time() - start_time
+                                speed = current_size / elapsed if elapsed > 0 else 0
+                                speed_mb = speed / (1024 * 1024)
+                                percent = (current_size / expected_size) * 100 if expected_size > 0 else 0
+                                progress_callback(current_size, expected_size, min(percent, 99.9), speed_mb)
+                        except (FileNotFoundError, OSError):
+                            pass
 
                     download_done.wait(timeout=0.5)
 

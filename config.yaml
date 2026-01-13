@@ -5,7 +5,7 @@ wan2gp_directory: ../Wan2GP-mryan
 
 # Bandwidth limit in KB/s (90000 = ~90 MB/s)
 # Set to null or 0 for unlimited
-bandwidth_limit_kb: 90000
+bandwidth_limit_kb: 70000
 
 # InvokeAI integration - query InvokeAI's database to find existing models
 # If a model exists in InvokeAI, create a symlink instead of downloading
