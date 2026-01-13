@@ -560,26 +560,27 @@ class ModelDownloader:
     def create_symlink(self, source_path: str, target_path: str) -> tuple[bool, str]:
         """Create symlink from source to target"""
         try:
-            target = Path(target_path)
-            source = Path(source_path)
-            
+            # Use absolute paths to avoid relative path issues
+            target = Path(target_path).resolve()
+            source = Path(source_path).resolve()
+
             # Check if source actually exists
             if not source.exists():
                 return False, f"Source file does not exist: {source_path}"
-            
+
             target.parent.mkdir(parents=True, exist_ok=True)
-            
+
             if target.exists() or target.is_symlink():
                 target.unlink()
-            
+
             target.symlink_to(source)
-            
+
             # Verify symlink was created successfully
             if target.is_symlink() and target.exists():
                 return True, "Symlink created successfully"
             else:
                 return False, f"Symlink verification failed for {target_path}"
-            
+
         except Exception as e:
             return False, f"Symlink creation failed: {str(e)}"
     
@@ -851,34 +852,98 @@ class ModelDownloader:
         
         return queue
     
-    def download_hf_file(self, url: str, output_path: str, item: Dict) -> tuple[bool, str]:
-        """Download file from HuggingFace using hf_hub_download"""
+    def download_hf_file(self, url: str, output_path: str, item: Dict, progress_callback=None) -> tuple[bool, str]:
+        """Download file from HuggingFace using hf_hub_download
+
+        Args:
+            url: HuggingFace URL to download
+            output_path: Where to save/symlink the file
+            item: Queue item dict for status tracking
+            progress_callback: Optional callback(downloaded_bytes, total_bytes, percent, speed_mb)
+        """
         try:
             repo_id, filename = self.parse_hf_url(url)
             if not repo_id or not filename:
                 return False, f"Failed to parse URL: {url}"
-            
+
             # Create output directory
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-            
-            # Download to HuggingFace cache first
-            cached_file = hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                cache_dir=str(self.cache_dir)
-            )
-            
+
+            # Get expected file size for progress tracking
+            expected_size = item.get('remote_size', 0)
+
+            # Start download in a separate thread so we can poll progress
+            download_result = {'cached_file': None, 'error': None}
+            download_done = threading.Event()
+
+            def do_download():
+                try:
+                    download_result['cached_file'] = hf_hub_download(
+                        repo_id=repo_id,
+                        filename=filename,
+                        cache_dir=str(self.cache_dir)
+                    )
+                except Exception as e:
+                    download_result['error'] = str(e)
+                finally:
+                    download_done.set()
+
+            # Start download thread
+            download_thread = threading.Thread(target=do_download)
+            download_thread.start()
+
+            # Poll progress while downloading
+            if progress_callback and expected_size > 0:
+                start_time = time.time()
+                # Find the incomplete file in HF cache to track progress
+                cache_path = Path(self.cache_dir)
+
+                while not download_done.is_set():
+                    # Look for incomplete download files (.incomplete)
+                    incomplete_files = list(cache_path.rglob("*.incomplete"))
+                    current_size = 0
+
+                    for incomplete in incomplete_files:
+                        if filename.replace('/', '_') in str(incomplete) or filename.split('/')[-1] in str(incomplete):
+                            try:
+                                current_size = incomplete.stat().st_size
+                                break
+                            except (FileNotFoundError, OSError):
+                                pass
+
+                    if current_size > 0:
+                        elapsed = time.time() - start_time
+                        speed = current_size / elapsed if elapsed > 0 else 0
+                        speed_mb = speed / (1024 * 1024)
+                        percent = (current_size / expected_size) * 100 if expected_size > 0 else 0
+                        progress_callback(current_size, expected_size, min(percent, 99.9), speed_mb)
+
+                    download_done.wait(timeout=0.5)
+
+            # Wait for download to complete
+            download_thread.join()
+
+            # Check for errors
+            if download_result['error']:
+                return False, f"Download error: {download_result['error']}"
+
+            cached_file = download_result['cached_file']
+
+            # Final progress callback
+            if progress_callback and expected_size > 0:
+                progress_callback(expected_size, expected_size, 100.0, 0)
+
             # Verify the cached file actually exists
             if not Path(cached_file).exists():
                 return False, f"HuggingFace returned non-existent file: {cached_file}"
-            
+
             # Create symlink from cache to destination
             success, msg = self.create_symlink(cached_file, output_path)
             if success:
                 return True, "Success"
             else:
                 return False, msg
-            
+
         except Exception as e:
             return False, f"Download error: {str(e)}"
 
@@ -1145,16 +1210,39 @@ class DownloaderApp(App):
         main_status = self.query_one("#main-status", Static)
         progress_bar = self.query_one("#progress-bar", ProgressBar)
         progress_info = self.query_one("#progress-info", Static)
-        
+
         # Show progress bar
         progress_bar.styles.visibility = "visible"
-        
+
         # Update progress bar
         progress_bar.update(total=total, progress=current)
-        
+
         # Update status text
         main_status.update(message)
         progress_info.update(f"{total}:{current}")
+
+    def update_download_progress(self, filename: str, downloaded: int, total: int, percent: float, speed_mb: float):
+        """Update the progress bar during file downloads"""
+        main_status = self.query_one("#main-status", Static)
+        progress_bar = self.query_one("#progress-bar", ProgressBar)
+        progress_info = self.query_one("#progress-info", Static)
+
+        # Show progress bar
+        progress_bar.styles.visibility = "visible"
+
+        # Update progress bar (use percentage as basis, scale to 100)
+        progress_bar.update(total=100, progress=percent)
+
+        # Format sizes for display
+        downloaded_mb = downloaded / (1024 * 1024)
+        total_mb = total / (1024 * 1024)
+
+        # Truncate filename for display
+        display_name = filename[:30] + ".." if len(filename) > 30 else filename
+
+        # Update status with filename and progress
+        main_status.update(f"Downloading: {display_name}")
+        progress_info.update(f"{downloaded_mb:.0f}/{total_mb:.0f} MB @ {speed_mb:.1f} MB/s")
     
     def hide_progress(self):
         """Hide the progress bar and reset status"""
@@ -1215,7 +1303,7 @@ class DownloaderApp(App):
             # Clean status display
             status = item['status']
             status_map = {
-                'pending': '',
+                'pending': '---',
                 'exists': 'Exists',
                 'symlinked': 'Linked',
                 'downloading': 'Downloading',
@@ -1541,7 +1629,7 @@ class DownloaderApp(App):
         
         
         self.call_from_thread(self.query_one("#log", Log).write_line, f"Processing: {filename}")
-        self.call_from_thread(self.query_one("#status", Static).update, f"Processing: {filename[:30]}...")
+        self.call_from_thread(self.query_one("#main-status", Static).update, f"Processing: {filename[:30]}...")
         
         # Check if file already exists
         if Path(output_path).exists() and not Path(output_path).is_symlink():
@@ -1565,8 +1653,21 @@ class DownloaderApp(App):
 
             # Download file using HuggingFace Hub
             self.call_from_thread(self.query_one("#log", Log).write_line, f"Downloading: {filename}")
-            
-            success, error_msg = self.downloader.download_hf_file(url, output_path, item)
+
+            # Create progress callback that updates the UI
+            def progress_callback(downloaded, total, percent, speed_mb):
+                self.call_from_thread(
+                    self.update_download_progress,
+                    filename, downloaded, total, percent, speed_mb
+                )
+
+            success, error_msg = self.downloader.download_hf_file(
+                url, output_path, item, progress_callback=progress_callback
+            )
+
+            # Hide progress bar after download
+            self.call_from_thread(self.hide_progress)
+
             if success:
                 item['status'] = 'completed'
                 item['progress'] = 100
@@ -1574,12 +1675,12 @@ class DownloaderApp(App):
             else:
                 item['status'] = 'failed'
                 self.call_from_thread(self.query_one("#log", Log).write_line, f"Failed: {filename} - {error_msg}")
-        
+
         self.call_from_thread(self.populate_table)
-        self.call_from_thread(self.query_one("#status", Static).update, "Ready")
-        
+        self.call_from_thread(self.query_one("#main-status", Static).update, "Ready")
+
         self.is_downloading = False
-    
+
     def action_quit(self):
         """Quit the application"""
         self.exit()
@@ -1633,7 +1734,20 @@ class DownloaderApp(App):
             # Download file using HuggingFace Hub
             self.call_from_thread(self.query_one("#log", Log).write_line, f"Downloading: {filename}")
 
-            success, error_msg = self.downloader.download_hf_file(url, output_path, item)
+            # Create progress callback that updates the UI
+            def progress_callback(downloaded, total, percent, speed_mb):
+                self.call_from_thread(
+                    self.update_download_progress,
+                    filename, downloaded, total, percent, speed_mb
+                )
+
+            success, error_msg = self.downloader.download_hf_file(
+                url, output_path, item, progress_callback=progress_callback
+            )
+
+            # Hide progress bar after download
+            self.call_from_thread(self.hide_progress)
+
             if success:
                 item['status'] = 'completed'
                 item['progress'] = 100
@@ -1641,12 +1755,12 @@ class DownloaderApp(App):
             else:
                 item['status'] = 'failed'
                 self.call_from_thread(self.query_one("#log", Log).write_line, f"Failed: {filename}")
-            
+
             self.call_from_thread(self.populate_table)
-        self.call_from_thread(self.query_one("#status", Static).update, "Ready")
-        
+        self.call_from_thread(self.query_one("#main-status", Static).update, "Ready")
+
         self.is_downloading = False
-    
+
     
     @work(exclusive=True, thread=True)
     async def start_selected_downloads(self):
@@ -1694,10 +1808,23 @@ class DownloaderApp(App):
                         self.call_from_thread(self.query_one("#log", Log).write_line, f"Symlinked from InvokeAI: {filename}")
                         continue
             
-            # Download file using HuggingFace Hub  
+            # Download file using HuggingFace Hub
             self.call_from_thread(self.query_one("#log", Log).write_line, f"Downloading: {filename}")
-            
-            success, error_msg = self.downloader.download_hf_file(url, output_path, item)
+
+            # Create progress callback that updates the UI
+            def progress_callback(downloaded, total, percent, speed_mb):
+                self.call_from_thread(
+                    self.update_download_progress,
+                    filename, downloaded, total, percent, speed_mb
+                )
+
+            success, error_msg = self.downloader.download_hf_file(
+                url, output_path, item, progress_callback=progress_callback
+            )
+
+            # Hide progress bar after download
+            self.call_from_thread(self.hide_progress)
+
             if success:
                 item['status'] = 'completed'
                 item['progress'] = 100
@@ -1705,9 +1832,9 @@ class DownloaderApp(App):
             else:
                 item['status'] = 'failed'
                 self.call_from_thread(self.query_one("#log", Log).write_line, f"Failed: {filename} - {error_msg}")
-            
+
             self.call_from_thread(self.populate_table)
-        self.call_from_thread(self.query_one("#status", Static).update, "Ready")
+        self.call_from_thread(self.query_one("#main-status", Static).update, "Ready")
         
         self.is_downloading = False
         completed_count = sum(1 for item in selected_items if item['status'] in ['exists', 'symlinked', 'completed'])
