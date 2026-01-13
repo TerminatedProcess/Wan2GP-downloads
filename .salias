@@ -4,6 +4,9 @@ alias pip='uv pip'
 alias rmenv='rmd $ENV_NAME .envrc down_env hfcache.db __pycache__; exit'
 alias mkenv='mkuv $ENV_NAME 3.12.10'
 alias run='kk;wandown;uv run streamlit run downloader_st.py'
+alias queue='uv run python hfqueue.py'
+alias qs='uv run python hfqueue.py --status'
+alias rq='python hfqueue.py'
 
 # Function to perform minimal install of comfy
 function install

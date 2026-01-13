@@ -14,13 +14,18 @@ import time
 import threading
 import sqlite3
 import logging
+import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Dict, List, Tuple, Optional
+from datetime import datetime
 
 import streamlit as st
 import pandas as pd
 from huggingface_hub import hf_hub_download, HfApi
+
+# Queue database path (shared with hfqueue.py)
+QUEUE_DB_PATH = "hfcache.db"
 
 try:
     from huggingface_hub import set_client_factory
@@ -685,6 +690,198 @@ class ModelDownloader:
             return False, f"Download error: {str(e)}"
 
 
+# Queue Management Functions
+def init_queue_table():
+    """Initialize the download queue table if it doesn't exist"""
+    conn = sqlite3.connect(QUEUE_DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS download_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL,
+            output_path TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            config_name TEXT,
+            remote_size INTEGER,
+            status TEXT DEFAULT 'pending',
+            progress INTEGER DEFAULT 0,
+            speed_mbps REAL DEFAULT 0,
+            error_message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_queue_status
+        ON download_queue(status)
+    ''')
+
+    conn.commit()
+    conn.close()
+
+
+def add_to_queue(items: List[Dict]) -> int:
+    """Add items to the download queue"""
+    init_queue_table()
+    conn = sqlite3.connect(QUEUE_DB_PATH)
+    cursor = conn.cursor()
+
+    added = 0
+    for item in items:
+        # Check if already in queue (pending or downloading)
+        cursor.execute('''
+            SELECT id FROM download_queue
+            WHERE output_path = ? AND status IN ('pending', 'downloading')
+        ''', (item['output_path'],))
+
+        if cursor.fetchone():
+            continue  # Skip if already queued
+
+        cursor.execute('''
+            INSERT INTO download_queue (url, output_path, filename, config_name, remote_size, status)
+            VALUES (?, ?, ?, ?, ?, 'pending')
+        ''', (item['url'], item['output_path'], item['filename'], item.get('config', ''), item.get('remote_size')))
+        added += 1
+
+    conn.commit()
+    conn.close()
+    return added
+
+
+def get_queue_items() -> List[Dict]:
+    """Get all items from the download queue"""
+    init_queue_table()
+    conn = sqlite3.connect(QUEUE_DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT id, url, output_path, filename, config_name, remote_size,
+               status, progress, speed_mbps, error_message, created_at, started_at, completed_at
+        FROM download_queue
+        ORDER BY created_at DESC
+    ''')
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    items = []
+    for row in rows:
+        items.append({
+            'id': row[0],
+            'url': row[1],
+            'output_path': row[2],
+            'filename': row[3],
+            'config_name': row[4],
+            'remote_size': row[5],
+            'status': row[6],
+            'progress': row[7],
+            'speed_mbps': row[8],
+            'error_message': row[9],
+            'created_at': row[10],
+            'started_at': row[11],
+            'completed_at': row[12]
+        })
+
+    return items
+
+
+def get_queue_stats() -> Dict:
+    """Get queue statistics"""
+    init_queue_table()
+    conn = sqlite3.connect(QUEUE_DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT status, COUNT(*)
+        FROM download_queue
+        GROUP BY status
+    ''')
+
+    stats = dict(cursor.fetchall())
+    conn.close()
+
+    return {
+        'pending': stats.get('pending', 0),
+        'downloading': stats.get('downloading', 0),
+        'complete': stats.get('complete', 0),
+        'failed': stats.get('failed', 0),
+        'linked': stats.get('linked', 0)
+    }
+
+
+def clear_queue(status_filter: str = None):
+    """Clear queue entries by status"""
+    conn = sqlite3.connect(QUEUE_DB_PATH)
+    cursor = conn.cursor()
+
+    if status_filter:
+        cursor.execute("DELETE FROM download_queue WHERE status = ?", (status_filter,))
+    else:
+        cursor.execute("DELETE FROM download_queue")
+
+    conn.commit()
+    conn.close()
+
+
+def remove_queue_item(item_id: int):
+    """Remove a specific item from the queue"""
+    conn = sqlite3.connect(QUEUE_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM download_queue WHERE id = ?", (item_id,))
+    conn.commit()
+    conn.close()
+
+
+def is_queue_processor_running() -> bool:
+    """Check if hfqueue processor is running"""
+    try:
+        result = subprocess.run(
+            ['pgrep', '-f', 'hfqueue.py'],
+            capture_output=True,
+            text=True
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def start_queue_processor() -> bool:
+    """Start the queue processor as a background process"""
+    try:
+        # Get the directory where this script is located
+        script_dir = Path(__file__).parent.absolute()
+        hfqueue_path = script_dir / "hfqueue.py"
+
+        # Start as detached process
+        subprocess.Popen(
+            ['python', str(hfqueue_path)],
+            cwd=str(script_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True  # Detach from parent process
+        )
+        return True
+    except Exception as e:
+        logging.error(f"Failed to start queue processor: {e}")
+        return False
+
+
+def stop_queue_processor() -> bool:
+    """Stop the queue processor"""
+    try:
+        result = subprocess.run(
+            ['pkill', '-f', 'hfqueue.py'],
+            capture_output=True,
+            text=True
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 # Streamlit UI
 def format_file_size(size_bytes: Optional[int]) -> str:
     """Format file size in bytes to human readable GB"""
@@ -718,107 +915,12 @@ def get_item_source(downloader, item) -> str:
     return "download"
 
 
-def main():
-    st.set_page_config(
-        page_title="WanGP Model Downloader",
-        page_icon="⬇️",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-
-    # Initialize session state
-    if 'downloader' not in st.session_state:
-        with st.spinner("Initializing downloader and loading models..."):
-            st.session_state.downloader = ModelDownloader(config_file="config.yaml")
-
-            # Auto-load queue on first startup (like Textual version)
-            downloader = st.session_state.downloader
-            st.session_state.download_queue = downloader.build_download_queue()
-
-            st.session_state.selected_items = set()
-            st.session_state.downloading = False
-
+def render_models_tab():
+    """Render the Models tab content"""
     downloader = st.session_state.downloader
+    show_all = st.session_state.get('show_all', False)
+    filter_text = st.session_state.get('filter_input', '')
 
-    # Sidebar - Compact design
-    with st.sidebar:
-        st.markdown("### WanGP Model Downloader")
-
-        if st.button("🔄 Refresh Queue", width="stretch", type="primary"):
-            with st.spinner("Building download queue..."):
-                progress_bar = st.progress(0, text="Building HuggingFace cache...")
-
-                def progress_callback(current, total):
-                    progress_bar.progress(current / total, text=f"Fetching metadata... {current}/{total}")
-
-                st.session_state.download_queue = downloader.build_download_queue(progress_callback=progress_callback)
-                progress_bar.empty()
-
-            st.success(f"✓ Loaded {len(st.session_state.download_queue)} models", icon="✅")
-
-        st.divider()
-
-        # Bandwidth limit control
-        st.markdown("**⚡ Bandwidth Limit**")
-        current_limit_kb = downloader.bandwidth_limit if downloader.bandwidth_limit else 90000
-        current_limit_mb = current_limit_kb / 1024  # Convert KB/s to MB/s
-
-        bandwidth_mb = st.slider(
-            "Download Speed (MB/s)",
-            min_value=1,
-            max_value=500,
-            value=int(current_limit_mb),
-            step=5,
-            help="Limit download speed to prevent network saturation",
-            label_visibility="collapsed"
-        )
-
-        st.caption(f"Current: {bandwidth_mb} MB/s (~{bandwidth_mb * 8:.0f} Mbps)")
-
-        # Update bandwidth limit if changed
-        new_limit_kb = bandwidth_mb * 1024
-        if new_limit_kb != current_limit_kb:
-            downloader.bandwidth_limit = new_limit_kb
-            # Reconfigure HTTP backend
-            if set_client_factory is not None:
-                def create_httpx_client():
-                    transport = BandwidthLimitedTransport(max_bytes_per_second=new_limit_kb * 1024)
-                    return httpx.Client(transport=transport)
-                set_client_factory(create_httpx_client)
-
-        st.divider()
-
-        # Filter
-        filter_text = st.text_input("🔍 Filter models", placeholder="Type to search...", key="filter_input")
-
-        show_all = st.checkbox("Show all files (including existing)", value=False, key="show_all")
-
-        st.divider()
-
-        if st.button("🗑️ Clear Cache", width="stretch"):
-            with st.spinner("Clearing cache and rebuilding..."):
-                downloader.clear_cache_db()
-
-                # Rebuild queue immediately with progress
-                progress_bar = st.progress(0, text="Fetching fresh metadata...")
-
-                def progress_callback(current, total):
-                    progress_bar.progress(current / total, text=f"Fetching metadata... {current}/{total}")
-
-                st.session_state.download_queue = downloader.build_download_queue(progress_callback=progress_callback)
-                progress_bar.empty()
-
-            st.success("✓ Cache cleared and rebuilt!")
-            st.rerun()
-
-        # Stats at bottom
-        if st.session_state.download_queue:
-            total = len(st.session_state.download_queue)
-            selected = len(st.session_state.selected_items)
-            view_mode = "All files" if show_all else "Not Downloaded"
-            st.caption(f"📊 Total: {total} models | View: {view_mode} | Selected: {selected}")
-
-    # Main area - No huge header, just content
     if not st.session_state.download_queue:
         st.info("No models found in download queue. Check your config.yaml settings.")
         return
@@ -862,39 +964,54 @@ def main():
             'Size (GB)': format_file_size(file_size),
             'Source': get_item_source(downloader, item),
             'Status': item['status'],
-            'Dest': destination,  # Shortened column name
-            '_output_path': item['output_path'],  # Hidden column for selection
+            'Dest': destination,
+            '_output_path': item['output_path'],
+            '_url': item['url'],
+            '_remote_size': item.get('remote_size'),
         })
 
     df = pd.DataFrame(df_data)
 
-    # Handle selection BEFORE rendering buttons (so counts are current)
+    # Handle selection BEFORE rendering buttons
     if 'model_table' in st.session_state:
         if 'selection' in st.session_state.model_table and 'rows' in st.session_state.model_table.selection:
             selected_rows = st.session_state.model_table.selection['rows']
             st.session_state.selected_items = set(df.iloc[selected_rows]['_output_path'].tolist())
 
-    # Compact action bar directly above table
+    # Compact action bar
     col1, col2, col3, col4, col5 = st.columns([1, 1, 2, 1, 2])
 
     with col1:
-        if st.button("✅ Select All", width="stretch", key="select_all"):
+        if st.button("Select All", width="stretch", key="select_all"):
             st.session_state.selected_items = set(df['_output_path'].tolist())
             st.rerun()
 
     with col2:
-        if st.button("❌ Clear", width="stretch", key="clear_all"):
+        if st.button("Clear", width="stretch", key="clear_all"):
             st.session_state.selected_items = set()
             st.rerun()
 
     with col3:
         selected_count = len(st.session_state.selected_items)
-        if st.button(f"⬇️ Download Selected ({selected_count})", width="stretch", disabled=selected_count == 0, type="primary"):
-            st.session_state.downloading = True
+        if st.button(f"Add to Queue ({selected_count})", width="stretch", disabled=selected_count == 0, type="primary"):
+            # Add selected items to download queue
+            selected_items = [
+                {
+                    'url': row['_url'],
+                    'output_path': row['_output_path'],
+                    'filename': row['Model File'],
+                    'config': row['Config'],
+                    'remote_size': row['_remote_size']
+                }
+                for _, row in df.iterrows()
+                if row['_output_path'] in st.session_state.selected_items
+            ]
+            added = add_to_queue(selected_items)
+            st.session_state.selected_items = set()
+            st.toast(f"Added {added} items to download queue")
             st.rerun()
 
     with col4:
-        # Empty spacer
         st.write("")
 
     with col5:
@@ -902,97 +1019,229 @@ def main():
         view_mode = "Showing All" if show_all else "Showing Not Downloaded"
         st.caption(view_mode)
 
-    # Display table with selection - fill vertical space
+    # Display table - hide internal columns
+    display_columns = ['Config', 'Model File', 'Size (GB)', 'Source', 'Status', 'Dest']
     st.dataframe(
-        df.drop(columns=['_output_path']),
-        use_container_width=True,
-        height=735,  # Tall table to fill screen
+        df[display_columns],
+        height=735,
         selection_mode="multi-row",
         on_select="rerun",
         key="model_table",
         hide_index=True
     )
 
-    # Download process
-    if st.session_state.downloading:
-        st.divider()
-        st.subheader("Downloading...")
 
-        selected_items = [
-            item for item in filtered_queue
-            if item['output_path'] in st.session_state.selected_items
-        ]
+def render_queue_tab():
+    """Render the Queue tab content"""
+    # Queue status header
+    stats = get_queue_stats()
+    processor_running = is_queue_processor_running()
 
-        overall_progress = st.progress(0, text="Starting...")
+    col1, col2, col3, col4, col5, col6 = st.columns([1, 1, 1, 1, 1, 2])
 
-        for i, item in enumerate(selected_items):
-            filename = item['filename']
-            url = item['url']
-            output_path = item['output_path']
+    with col1:
+        st.metric("Pending", stats['pending'])
 
-            # Use st.status for live updates
-            with st.status(f"📥 Downloading: {filename[:50]}...", expanded=True) as status:
-                # Check if already exists
-                if Path(output_path).exists() and not Path(output_path).is_symlink():
-                    item['status'] = 'Exists'
-                    st.write("✓ File already exists")
-                    status.update(label=f"✓ {filename[:50]}", state="complete")
-                    continue
+    with col2:
+        st.metric("Downloading", stats['downloading'])
 
-                # Check InvokeAI
-                if downloader.invokeai_enabled:
-                    invokeai_path = downloader.find_in_invokeai(url)
-                    if invokeai_path:
-                        success, msg = downloader.create_symlink(invokeai_path, output_path)
-                        if success:
-                            item['status'] = 'Linked'
-                            st.write("✓ Symlinked from InvokeAI")
-                            status.update(label=f"✓ {filename[:50]}", state="complete")
-                            continue
+    with col3:
+        st.metric("Complete", stats['complete'])
 
-                # Download with progress tracking
-                st.write(f"Size: {format_file_size(item.get('remote_size'))} GB")
-                file_progress = st.progress(0, text="Starting download...")
+    with col4:
+        st.metric("Failed", stats['failed'])
 
-                # Store progress in session state for updates
-                if 'download_progress' not in st.session_state:
-                    st.session_state.download_progress = {}
+    with col5:
+        if processor_running:
+            st.success("Running")
+        else:
+            st.warning("Stopped")
 
-                def progress_callback(downloaded, total, percent, speed_mb):
-                    # Store in session state
-                    st.session_state.download_progress = {
-                        'downloaded': downloaded,
-                        'total': total,
-                        'percent': percent,
-                        'speed_mb': speed_mb
-                    }
-
-                success, error_msg = downloader.download_hf_file(url, output_path, item, progress_callback=progress_callback)
-
-                # Show final progress
-                if 'download_progress' in st.session_state and st.session_state.download_progress:
-                    prog = st.session_state.download_progress
-                    downloaded_mb = prog['downloaded'] / (1024 * 1024)
-                    total_mb = prog['total'] / (1024 * 1024)
-                    file_progress.progress(1.0, text=f"✓ {downloaded_mb:.0f}/{total_mb:.0f} MB complete")
-
-                if success:
-                    item['status'] = 'Complete'
-                    st.write("✓ Download complete")
-                    status.update(label=f"✓ {filename[:50]}", state="complete")
+    with col6:
+        # Start/Stop processor buttons
+        if processor_running:
+            if st.button("Stop Processor", width="stretch", type="secondary", key="stop_processor"):
+                if stop_queue_processor():
+                    st.toast("Processor stopped")
+                    time.sleep(0.5)  # Brief pause for process to terminate
+                    st.rerun()
                 else:
-                    item['status'] = 'Failed'
-                    st.write(f"✗ Error: {error_msg}")
-                    status.update(label=f"✗ {filename[:50]}", state="error")
+                    st.error("Failed to stop processor")
+        else:
+            if st.button("Start Processor", width="stretch", type="primary", key="start_processor"):
+                if start_queue_processor():
+                    st.toast("Processor started")
+                    time.sleep(0.5)  # Brief pause for process to start
+                    st.rerun()
+                else:
+                    st.error("Failed to start processor")
 
-            # Update overall progress
-            overall_progress.progress((i + 1) / len(selected_items), text=f"Progress: {i + 1}/{len(selected_items)}")
+    st.divider()
 
-        st.session_state.downloading = False
-        st.success("Downloads complete!")
+    # Action buttons
+    col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 2])
 
-        if st.button("Done"):
+    with col1:
+        if st.button("🔄 Refresh", width="stretch", type="primary", key="refresh_queue"):
             st.rerun()
+
+    with col2:
+        if st.button("Clear Complete", width="stretch", key="clear_complete"):
+            clear_queue('complete')
+            st.toast("Cleared completed items")
+            st.rerun()
+
+    with col3:
+        if st.button("Clear Failed", width="stretch", key="clear_failed"):
+            clear_queue('failed')
+            st.toast("Cleared failed items")
+            st.rerun()
+
+    with col4:
+        if st.button("Clear All", width="stretch", key="clear_all_queue"):
+            clear_queue()
+            st.toast("Cleared all queue items")
+            st.rerun()
+
+    with col5:
+        st.write("")
+
+    # Queue items table
+    queue_items = get_queue_items()
+
+    if not queue_items:
+        st.info("Download queue is empty. Select models in the Models tab and click 'Add to Queue'.")
+        return
+
+    # Build dataframe
+    df_data = []
+    for item in queue_items:
+        status_icon = {
+            'pending': '⏳',
+            'downloading': '📥',
+            'complete': '✅',
+            'failed': '❌',
+            'linked': '🔗'
+        }.get(item['status'], '❓')
+
+        progress_str = f"{item['progress']}%" if item['progress'] else "-"
+        speed_str = f"{item['speed_mbps']:.1f} MB/s" if item['speed_mbps'] else "-"
+        size_str = format_file_size(item['remote_size']) if item['remote_size'] else "-"
+
+        df_data.append({
+            'ID': item['id'],
+            'Status': f"{status_icon} {item['status']}",
+            'Filename': item['filename'],
+            'Size (GB)': size_str,
+            'Progress': progress_str,
+            'Speed': speed_str,
+            'Error': item['error_message'] or "-",
+            'Added': item['created_at'][:16] if item['created_at'] else "-"
+        })
+
+    df = pd.DataFrame(df_data)
+
+    st.dataframe(
+        df,
+        height=600,
+        hide_index=True,
+        column_config={
+            'ID': st.column_config.NumberColumn(width="small"),
+            'Status': st.column_config.TextColumn(width="medium"),
+            'Filename': st.column_config.TextColumn(width="large"),
+            'Size (GB)': st.column_config.TextColumn(width="small"),
+            'Progress': st.column_config.TextColumn(width="small"),
+            'Speed': st.column_config.TextColumn(width="small"),
+            'Error': st.column_config.TextColumn(width="medium"),
+            'Added': st.column_config.TextColumn(width="medium"),
+        }
+    )
+
+
+def main():
+    st.set_page_config(
+        page_title="WanGP Model Downloader",
+        page_icon="⬇️",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+
+    # Initialize queue table
+    init_queue_table()
+
+    # Initialize session state
+    if 'downloader' not in st.session_state:
+        with st.spinner("Initializing downloader and loading models..."):
+            st.session_state.downloader = ModelDownloader(config_file="config.yaml")
+            downloader = st.session_state.downloader
+            st.session_state.download_queue = downloader.build_download_queue()
+            st.session_state.selected_items = set()
+
+    downloader = st.session_state.downloader
+
+    # Sidebar
+    with st.sidebar:
+        st.markdown("### WanGP Model Downloader")
+
+        if st.button("🔄 Refresh Models", width="stretch", type="primary"):
+            with st.spinner("Building download queue..."):
+                progress_bar = st.progress(0, text="Building HuggingFace cache...")
+
+                def progress_callback(current, total):
+                    progress_bar.progress(current / total, text=f"Fetching metadata... {current}/{total}")
+
+                st.session_state.download_queue = downloader.build_download_queue(progress_callback=progress_callback)
+                progress_bar.empty()
+
+            st.success(f"Loaded {len(st.session_state.download_queue)} models")
+
+        st.divider()
+
+        # Bandwidth limit (shown in sidebar for reference)
+        st.markdown("**Bandwidth Limit**")
+        current_limit_kb = downloader.bandwidth_limit if downloader.bandwidth_limit else 90000
+        current_limit_mb = current_limit_kb / 1024
+        st.caption(f"Current: {current_limit_mb:.0f} MB/s (~{current_limit_mb * 8:.0f} Mbps)")
+        st.caption("Edit config.yaml to change")
+
+        st.divider()
+
+        # Filter
+        filter_text = st.text_input("🔍 Filter models", placeholder="Type to search...", key="filter_input")
+
+        show_all = st.checkbox("Show all files", value=False, key="show_all")
+
+        st.divider()
+
+        if st.button("🗑️ Clear HF Cache", width="stretch"):
+            with st.spinner("Clearing cache and rebuilding..."):
+                downloader.clear_cache_db()
+                progress_bar = st.progress(0, text="Fetching fresh metadata...")
+
+                def progress_callback(current, total):
+                    progress_bar.progress(current / total, text=f"Fetching metadata... {current}/{total}")
+
+                st.session_state.download_queue = downloader.build_download_queue(progress_callback=progress_callback)
+                progress_bar.empty()
+
+            st.success("Cache cleared!")
+            st.rerun()
+
+        # Queue stats at bottom
+        stats = get_queue_stats()
+        if stats['pending'] > 0 or stats['downloading'] > 0:
+            st.divider()
+            st.markdown("**Queue Status**")
+            st.caption(f"⏳ {stats['pending']} pending | 📥 {stats['downloading']} active")
+
+    # Main content with tabs
+    tab1, tab2 = st.tabs(["📦 Models", "📥 Queue"])
+
+    with tab1:
+        render_models_tab()
+
+    with tab2:
+        render_queue_tab()
 
 
 if __name__ == "__main__":
