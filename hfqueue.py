@@ -144,18 +144,11 @@ class QueueProcessor:
 
     def _configure_bandwidth_limit(self):
         """Configure bandwidth limiting for HuggingFace downloads"""
-        if self.bandwidth_limit:
-            if set_client_factory is not None:
-                def create_httpx_client():
-                    transport = BandwidthLimitedTransport(
-                        max_bytes_per_second=self.bandwidth_limit * 1024
-                    )
-                    return httpx.Client(transport=transport)
-                set_client_factory(create_httpx_client)
-            elif configure_http_backend is not None:
-                def create_session():
-                    return BandwidthLimitedSession(max_bytes_per_second=self.bandwidth_limit * 1024)
-                configure_http_backend(backend_factory=create_session)
+        # Note: Bandwidth limiting via custom transport can interfere with
+        # HuggingFace's retry mechanism. For now, we skip custom transport
+        # and rely on system-level throttling if needed (e.g., trickle, tc).
+        # The bandwidth_limit config is still read but not applied at HTTP level.
+        pass
 
     def load_config(self, config_file: str) -> dict:
         """Load configuration from YAML file"""
@@ -198,6 +191,24 @@ class QueueProcessor:
 
         conn.commit()
         conn.close()
+
+    def reset_stale_downloads(self):
+        """Reset any 'downloading' jobs back to 'pending' on startup"""
+        conn = sqlite3.connect(QUEUE_DB_PATH)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            UPDATE download_queue
+            SET status = 'pending', progress = 0, speed_mbps = 0
+            WHERE status = 'downloading'
+        ''')
+
+        count = cursor.rowcount
+        conn.commit()
+        conn.close()
+
+        if count > 0:
+            print(f"Reset {count} interrupted download(s) to pending")
 
     def get_next_job(self) -> Optional[Dict]:
         """Get the next pending job from the queue"""
@@ -301,7 +312,7 @@ class QueueProcessor:
         url = job['url']
         output_path = job['output_path']
         job_id = job['id']
-        expected_size = job.get('remote_size', 0)
+        expected_size = job.get('remote_size') or 0
 
         # Check if file already exists
         if Path(output_path).exists():
@@ -311,6 +322,9 @@ class QueueProcessor:
         if not repo_id or not filename:
             return False, f"Failed to parse URL: {url}"
 
+        print(f"  Repo: {repo_id}")
+        print(f"  File: {filename}")
+
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
         download_result = {'cached_file': None, 'error': None}
@@ -318,13 +332,16 @@ class QueueProcessor:
 
         def do_download():
             try:
+                print("  Starting hf_hub_download...")
                 download_result['cached_file'] = hf_hub_download(
                     repo_id=repo_id,
                     filename=filename,
                     cache_dir=str(self.cache_dir)
                 )
+                print(f"  Download returned: {download_result['cached_file']}")
             except Exception as e:
                 download_result['error'] = str(e)
+                print(f"  Download error: {e}")
             finally:
                 download_done.set()
 
@@ -332,13 +349,14 @@ class QueueProcessor:
         download_thread.start()
 
         # Poll progress and update database
-        if expected_size > 0:
-            start_time = time.time()
-            cache_path = Path(self.cache_dir)
-            last_size = 0
-            last_update = 0
+        start_time = time.time()
+        cache_path = Path(self.cache_dir)
+        last_size = 0
+        last_update = 0
 
-            while not download_done.is_set():
+        while not download_done.is_set():
+            # Only show detailed progress if we know the expected size
+            if expected_size > 0:
                 incomplete_files = list(cache_path.rglob("*.incomplete"))
 
                 if incomplete_files:
@@ -353,7 +371,7 @@ class QueueProcessor:
                             elapsed = time.time() - start_time
                             speed = current_size / elapsed if elapsed > 0 else 0
                             speed_mb = speed / (1024 * 1024)
-                            percent = int((current_size / expected_size) * 100) if expected_size > 0 else 0
+                            percent = int((current_size / expected_size) * 100)
                             percent = min(percent, 99)
 
                             # Update database every second
@@ -371,9 +389,16 @@ class QueueProcessor:
 
                     except (FileNotFoundError, OSError):
                         pass
+            else:
+                # No size info - just show elapsed time
+                elapsed = time.time() - start_time
+                if time.time() - last_update >= 5:
+                    print(f"  Downloading... ({elapsed:.0f}s elapsed)")
+                    last_update = time.time()
 
-                download_done.wait(timeout=0.5)
+            download_done.wait(timeout=0.5)
 
+        if expected_size > 0:
             print()  # New line after progress bar
 
         download_thread.join()
@@ -382,6 +407,9 @@ class QueueProcessor:
             return False, f"Download error: {download_result['error']}"
 
         cached_file = download_result['cached_file']
+
+        if not cached_file:
+            return False, "Download returned no file path"
 
         if not Path(cached_file).exists():
             return False, f"HuggingFace returned non-existent file: {cached_file}"
@@ -450,6 +478,10 @@ class QueueProcessor:
         print(f"Bandwidth limit: {self.bandwidth_limit} KB/s ({self.bandwidth_limit/1024:.0f} MB/s)")
         print(f"Poll interval: {self.poll_interval} seconds")
         print("-" * 60)
+
+        # Reset any interrupted downloads from previous runs
+        self.reset_stale_downloads()
+
         print("Waiting for jobs... (Ctrl+C to stop)")
         print()
 
