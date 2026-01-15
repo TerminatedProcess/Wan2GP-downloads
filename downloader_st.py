@@ -1036,6 +1036,27 @@ def group_high_low_models(queue_items: List[Dict]) -> List[Dict]:
     return result
 
 
+def update_model_statuses():
+    """Check filesystem and update model statuses"""
+    changed = False
+    for item in st.session_state.download_queue:
+        output_path = Path(item['output_path'])
+        if output_path.exists() and item['status'] == '---':
+            if output_path.is_symlink():
+                item['status'] = 'Linked'
+            else:
+                item['status'] = 'Exists'
+            changed = True
+    return changed
+
+
+@st.fragment(run_every="10s")
+def models_status_checker():
+    """Background checker that triggers refresh when models are downloaded"""
+    if update_model_statuses():
+        st.rerun()
+
+
 def render_models_tab():
     """Render the Models tab content"""
     downloader = st.session_state.downloader
@@ -1046,14 +1067,11 @@ def render_models_tab():
         st.info("No models found in download queue. Check your config.yaml settings.")
         return
 
+    # Background status checker (runs every 10s)
+    models_status_checker()
+
     # Update status for all items first
-    for item in st.session_state.download_queue:
-        file_exists = Path(item['output_path']).exists()
-        if file_exists and item['status'] == '---':
-            if Path(item['output_path']).is_symlink():
-                item['status'] = 'Linked'
-            else:
-                item['status'] = 'Exists'
+    update_model_statuses()
 
     # Group HIGH/LOW pairs
     grouped_queue = group_high_low_models(st.session_state.download_queue)
@@ -1187,9 +1205,9 @@ def render_models_tab():
     )
 
 
-def render_queue_tab():
-    """Render the Queue tab content"""
-    # Queue status header
+@st.fragment(run_every="3s")
+def render_queue_status():
+    """Auto-refreshing queue status display"""
     stats = get_queue_stats()
     processor_running = is_queue_processor_running()
 
@@ -1219,48 +1237,18 @@ def render_queue_tab():
             if st.button("Stop Processor", width="stretch", type="secondary", key="stop_processor"):
                 if stop_queue_processor():
                     st.toast("Processor stopped")
-                    time.sleep(0.5)  # Brief pause for process to terminate
-                    st.rerun()
+                    time.sleep(0.5)
                 else:
                     st.error("Failed to stop processor")
         else:
             if st.button("Start Processor", width="stretch", type="primary", key="start_processor"):
                 if start_queue_processor():
                     st.toast("Processor started")
-                    time.sleep(0.5)  # Brief pause for process to start
-                    st.rerun()
+                    time.sleep(0.5)
                 else:
                     st.error("Failed to start processor")
 
     st.divider()
-
-    # Action buttons
-    col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 2])
-
-    with col1:
-        if st.button("🔄 Refresh", width="stretch", type="primary", key="refresh_queue"):
-            st.rerun()
-
-    with col2:
-        if st.button("Clear Complete", width="stretch", key="clear_complete"):
-            clear_queue('complete')
-            st.toast("Cleared completed items")
-            st.rerun()
-
-    with col3:
-        if st.button("Clear Failed", width="stretch", key="clear_failed"):
-            clear_queue('failed')
-            st.toast("Cleared failed items")
-            st.rerun()
-
-    with col4:
-        if st.button("Clear All", width="stretch", key="clear_all_queue"):
-            clear_queue()
-            st.toast("Cleared all queue items")
-            st.rerun()
-
-    with col5:
-        st.write("")
 
     # Queue items table
     queue_items = get_queue_items()
@@ -1312,6 +1300,38 @@ def render_queue_tab():
             'Added': st.column_config.TextColumn(width="medium"),
         }
     )
+
+
+def render_queue_tab():
+    """Render the Queue tab content"""
+    # Action buttons (outside fragment so they don't auto-refresh)
+    col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 2])
+
+    with col1:
+        if st.button("Clear Complete", width="stretch", key="clear_complete"):
+            clear_queue('complete')
+            st.toast("Cleared completed items")
+
+    with col2:
+        if st.button("Clear Failed", width="stretch", key="clear_failed"):
+            clear_queue('failed')
+            st.toast("Cleared failed items")
+
+    with col3:
+        if st.button("Clear All", width="stretch", key="clear_all_queue"):
+            clear_queue()
+            st.toast("Cleared all queue items")
+
+    with col4:
+        st.caption("Auto-refresh: 3s")
+
+    with col5:
+        st.write("")
+
+    st.divider()
+
+    # Auto-refreshing status and table
+    render_queue_status()
 
 
 def main():
