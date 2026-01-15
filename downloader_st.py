@@ -24,6 +24,8 @@ import streamlit as st
 import pandas as pd
 from huggingface_hub import hf_hub_download, HfApi
 
+from hash_index import HashIndex
+
 # Queue database path (shared with hfqueue.py)
 QUEUE_DB_PATH = "hfcache.db"
 
@@ -140,6 +142,16 @@ class ModelDownloader:
             self.invokeai_models_dir is not None and
             self.invokeai_models_dir.exists()
         )
+
+        # SHA256 hash index for InvokeAI models
+        self.parallel_hash_workers = self.config.get("parallel_hash_workers", 8)
+        self.hash_index = None
+        if self.invokeai_enabled:
+            self.hash_index = HashIndex(
+                str(self.invokeai_db),
+                str(self.invokeai_models_dir),
+                self.parallel_hash_workers
+            )
 
         # Legacy hub support
         self.hub_dir = Path(hub_dir) if hub_dir else None
@@ -357,19 +369,37 @@ class ModelDownloader:
 
         return None
 
-    def find_in_invokeai(self, url: str) -> Optional[str]:
-        """Find model in InvokeAI database by source URL or filename"""
+    def find_in_invokeai(self, url: str, sha256_hash: str = None) -> Optional[str]:
+        """Find model in InvokeAI database by SHA256 hash, source URL, or filename.
+
+        Priority:
+        1. SHA256 hash lookup (most reliable, hash-based matching)
+        2. Source URL exact match (legacy fallback)
+        3. Filename pattern match (last resort)
+        """
         if not self.invokeai_enabled:
             return None
 
+        # Priority 1: SHA256 hash lookup via hash index
+        if sha256_hash and self.hash_index and self.hash_index.is_ready():
+            result = self.hash_index.lookup_by_sha256(sha256_hash)
+            if result:
+                file_path = Path(result['file_path'])
+                if file_path.exists():
+                    logging.info(f"Found model via SHA256: {file_path.name}")
+                    return str(file_path)
+
+        # Priority 2 & 3: URL and filename fallback
         try:
             conn = sqlite3.connect(str(self.invokeai_db))
             cursor = conn.cursor()
 
+            # Try exact source URL match
             cursor.execute("SELECT path FROM models WHERE source = ?", (url,))
             result = cursor.fetchone()
 
             if not result:
+                # Try filename pattern match
                 filename = Path(urlparse(url).path).name
                 cursor.execute("SELECT path FROM models WHERE source LIKE ?", (f"%/{filename}",))
                 result = cursor.fetchone()
@@ -587,8 +617,26 @@ class ModelDownloader:
                             progress_callback(processed, total_misses)
                             self.cache_file_info(cache_key, repo_id, filename, None, str(e))
 
-        # Third pass: check InvokeAI
+        # Third pass: check InvokeAI and create symlinks
         if self.invokeai_enabled:
+            # Get all SHA256 hashes from cache in one query
+            all_cache_keys = list(url_to_cache_key.values()) if url_to_cache_key else []
+            sha256_by_key = {}
+            if all_cache_keys:
+                try:
+                    conn = sqlite3.connect(self.cache_db_path)
+                    cursor = conn.cursor()
+                    placeholders = ','.join('?' * len(all_cache_keys))
+                    cursor.execute(f'''
+                        SELECT cache_key, file_hash
+                        FROM hf_file_cache
+                        WHERE cache_key IN ({placeholders}) AND file_hash IS NOT NULL
+                    ''', all_cache_keys)
+                    sha256_by_key = dict(cursor.fetchall())
+                    conn.close()
+                except Exception as e:
+                    logging.error(f"Error fetching SHA256 hashes: {e}")
+
             for item in queue:
                 output_path = Path(item['output_path'])
 
@@ -602,7 +650,11 @@ class ModelDownloader:
                 if not item['url'].startswith('http'):
                     continue
 
-                invokeai_path = self.find_in_invokeai(item['url'])
+                # Get SHA256 hash for this item
+                cache_key = url_to_cache_key.get(item['url'])
+                sha256_hash = sha256_by_key.get(cache_key) if cache_key else None
+
+                invokeai_path = self.find_in_invokeai(item['url'], sha256_hash=sha256_hash)
                 if invokeai_path:
                     success, msg = self.create_symlink(invokeai_path, str(output_path))
                     if success:
@@ -915,6 +967,75 @@ def get_item_source(downloader, item) -> str:
     return "download"
 
 
+def is_high_precision(filename: str) -> bool:
+    """Check if filename indicates high precision (non-quantized)"""
+    name = filename.lower()
+    # Quantized files have 'quanto' in the name
+    if '_quanto_' in name:
+        return False
+    # High precision files typically end with bf16, fp16, mbf16, mfp16
+    if any(name.endswith(f'_{p}.safetensors') for p in ['bf16', 'fp16', 'mbf16', 'mfp16']):
+        return True
+    # Files without precision suffix are also considered "high" (full model)
+    return True
+
+
+def group_high_low_models(queue_items: List[Dict]) -> List[Dict]:
+    """
+    Group HIGH/LOW model pairs into single entries.
+    Only pairs configs that have exactly 2 files (1 high + 1 low).
+    Configs with 3+ files are shown as individual entries (alternatives).
+    """
+    from collections import defaultdict
+
+    # Group by config name
+    configs = defaultdict(list)
+    for item in queue_items:
+        configs[item['config']].append(item)
+
+    result = []
+    for config_name, items in configs.items():
+        # Only pair if exactly 2 files: 1 high-precision + 1 quantized
+        if len(items) == 2:
+            high_items = [i for i in items if is_high_precision(i['filename'])]
+            low_items = [i for i in items if not is_high_precision(i['filename'])]
+
+            if len(high_items) == 1 and len(low_items) == 1:
+                # Valid HIGH/LOW pair
+                high_item = high_items[0]
+                low_item = low_items[0]
+
+                merged = high_item.copy()
+                merged['_is_pair'] = True
+                merged['_high_item'] = high_item
+                merged['_low_items'] = [low_item]
+                merged['_display_name'] = f"{high_item['filename'].replace('.safetensors', '')} (high/low)"
+
+                # Combined status
+                statuses = [high_item['status'], low_item['status']]
+                if '---' in statuses:
+                    merged['status'] = '---'
+                elif all(s in ['Exists', 'Linked', 'Complete'] for s in statuses):
+                    merged['status'] = 'Complete'
+                else:
+                    merged['status'] = high_item['status']
+
+                # Combined size
+                total_size = (high_item.get('remote_size') or 0) + (low_item.get('remote_size') or 0)
+                merged['_total_size'] = total_size if total_size > 0 else None
+
+                result.append(merged)
+                continue
+
+        # Not a pair - add items individually
+        for item in items:
+            item['_is_pair'] = False
+            item['_display_name'] = item['filename']
+            result.append(item)
+
+    return result
+
+
 def render_models_tab():
     """Render the Models tab content"""
     downloader = st.session_state.downloader
@@ -925,10 +1046,8 @@ def render_models_tab():
         st.info("No models found in download queue. Check your config.yaml settings.")
         return
 
-    # Filter queue
-    filtered_queue = []
+    # Update status for all items first
     for item in st.session_state.download_queue:
-        # Update status if file exists
         file_exists = Path(item['output_path']).exists()
         if file_exists and item['status'] == '---':
             if Path(item['output_path']).is_symlink():
@@ -936,8 +1055,15 @@ def render_models_tab():
             else:
                 item['status'] = 'Exists'
 
+    # Group HIGH/LOW pairs
+    grouped_queue = group_high_low_models(st.session_state.download_queue)
+
+    # Filter grouped queue
+    filtered_queue = []
+    for item in grouped_queue:
         # Filter by text
-        if filter_text and filter_text.lower() not in item['filename'].lower():
+        display_name = item.get('_display_name', item['filename'])
+        if filter_text and filter_text.lower() not in display_name.lower():
             continue
 
         # Filter by show_all
@@ -952,22 +1078,27 @@ def render_models_tab():
         wan2gp_prefix = str(downloader.wan2gp_dir) + "/"
         destination = item['output_path'].replace(wan2gp_prefix, "").split("/")[0]
 
-        file_size = None
-        if Path(item['output_path']).exists():
+        # Use combined size for pairs, otherwise individual size
+        if item.get('_is_pair') and item.get('_total_size'):
+            file_size = item['_total_size']
+        elif Path(item['output_path']).exists():
             file_size = Path(item['output_path']).stat().st_size
         else:
             file_size = item.get('remote_size')
 
+        # Use display name (includes "(high/low)" for pairs)
+        display_name = item.get('_display_name', item['filename'])
+
         df_data.append({
             'Config': item['config'],
-            'Model File': item['filename'],
+            'Model File': display_name,
             'Size (GB)': format_file_size(file_size),
             'Source': get_item_source(downloader, item),
             'Status': item['status'],
             'Dest': destination,
-            '_output_path': item['output_path'],
-            '_url': item['url'],
-            '_remote_size': item.get('remote_size'),
+            '_output_path': item['output_path'],  # Used as unique key
+            '_is_pair': item.get('_is_pair', False),
+            '_item_ref': item,  # Reference to full item for queue addition
         })
 
     df = pd.DataFrame(df_data)
@@ -994,19 +1125,44 @@ def render_models_tab():
     with col3:
         selected_count = len(st.session_state.selected_items)
         if st.button(f"Add to Queue ({selected_count})", width="stretch", disabled=selected_count == 0, type="primary"):
-            # Add selected items to download queue
-            selected_items = [
-                {
-                    'url': row['_url'],
-                    'output_path': row['_output_path'],
-                    'filename': row['Model File'],
-                    'config': row['Config'],
-                    'remote_size': row['_remote_size']
-                }
-                for _, row in df.iterrows()
-                if row['_output_path'] in st.session_state.selected_items
-            ]
-            added = add_to_queue(selected_items)
+            # Build list of items to add to queue
+            # For pairs, add both HIGH and LOW items
+            queue_items = []
+            for _, row in df.iterrows():
+                if row['_output_path'] not in st.session_state.selected_items:
+                    continue
+
+                item = row['_item_ref']
+                if item.get('_is_pair'):
+                    # Add HIGH item
+                    high = item['_high_item']
+                    queue_items.append({
+                        'url': high['url'],
+                        'output_path': high['output_path'],
+                        'filename': high['filename'],
+                        'config': high['config'],
+                        'remote_size': high.get('remote_size')
+                    })
+                    # Add all LOW items
+                    for low in item['_low_items']:
+                        queue_items.append({
+                            'url': low['url'],
+                            'output_path': low['output_path'],
+                            'filename': low['filename'],
+                            'config': low['config'],
+                            'remote_size': low.get('remote_size')
+                        })
+                else:
+                    # Single item
+                    queue_items.append({
+                        'url': item['url'],
+                        'output_path': item['output_path'],
+                        'filename': item['filename'],
+                        'config': item['config'],
+                        'remote_size': item.get('remote_size')
+                    })
+
+            added = add_to_queue(queue_items)
             st.session_state.selected_items = set()
             st.toast(f"Added {added} items to download queue")
             st.rerun()
@@ -1171,13 +1327,47 @@ def main():
 
     # Initialize session state
     if 'downloader' not in st.session_state:
-        with st.spinner("Initializing downloader and loading models..."):
-            st.session_state.downloader = ModelDownloader(config_file="config.yaml")
-            downloader = st.session_state.downloader
-            st.session_state.download_queue = downloader.build_download_queue()
-            st.session_state.selected_items = set()
+        st.session_state.downloader = ModelDownloader(config_file="config.yaml")
+        st.session_state.hash_index_ready = False
+        st.session_state.selected_items = set()
+        st.session_state.download_queue = []
 
     downloader = st.session_state.downloader
+
+    # Initialize hash index if InvokeAI is enabled
+    if downloader.hash_index and not st.session_state.get('hash_index_ready', False):
+        hash_index = downloader.hash_index
+
+        # Sync from InvokeAI database
+        with st.spinner("Syncing hash index from InvokeAI..."):
+            added = hash_index.sync_from_invokeai()
+
+        stats = hash_index.get_stats()
+
+        if stats['pending'] > 0:
+            # Show progress UI for hash computation
+            st.info(f"Computing SHA256 hashes for {stats['pending']} models. This is required for accurate model matching.")
+            progress_bar = st.progress(0, text="Computing SHA256 hashes...")
+            status_text = st.empty()
+
+            def hash_progress_callback(current, total, filename):
+                pct = current / total if total > 0 else 0
+                progress_bar.progress(pct, text=f"Hashing {current}/{total}")
+                status_text.caption(f"Current: {filename[:60]}...")
+
+            # Compute hashes
+            hash_index.compute_pending_hashes(progress_callback=hash_progress_callback)
+
+            progress_bar.empty()
+            status_text.empty()
+            st.success(f"Hash index ready! {stats['total']} models indexed.")
+
+        st.session_state.hash_index_ready = True
+
+    # Build download queue after hash index is ready
+    if not st.session_state.download_queue:
+        with st.spinner("Building download queue..."):
+            st.session_state.download_queue = downloader.build_download_queue()
 
     # Sidebar
     with st.sidebar:
@@ -1226,6 +1416,39 @@ def main():
 
             st.success("Cache cleared!")
             st.rerun()
+
+        # Hash index status
+        if downloader.hash_index:
+            st.divider()
+            st.markdown("**SHA256 Hash Index**")
+            hash_stats = downloader.hash_index.get_stats()
+            if hash_stats['exists']:
+                st.caption(f"Models: {hash_stats['total']} | Pending: {hash_stats['pending']}")
+                if hash_stats['pending'] > 0:
+                    st.warning(f"{hash_stats['pending']} hashes pending")
+            else:
+                st.caption("Not initialized")
+
+            if st.button("🔄 Rebuild Hash Index", width="stretch"):
+                from hash_index import rebuild_index
+                with st.spinner("Rebuilding hash index..."):
+                    progress_bar = st.progress(0, text="Computing SHA256 hashes...")
+
+                    def hash_rebuild_callback(current, total, filename):
+                        pct = current / total if total > 0 else 0
+                        progress_bar.progress(pct, text=f"Hashing {current}/{total}")
+
+                    rebuild_index(
+                        str(downloader.invokeai_db),
+                        str(downloader.invokeai_models_dir),
+                        downloader.parallel_hash_workers,
+                        hash_rebuild_callback
+                    )
+                    progress_bar.empty()
+
+                st.success("Hash index rebuilt!")
+                st.session_state.hash_index_ready = True
+                st.rerun()
 
         # Queue stats at bottom
         stats = get_queue_stats()

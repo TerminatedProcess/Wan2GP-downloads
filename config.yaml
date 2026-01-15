@@ -11,3 +11,8 @@ bandwidth_limit_kb: 30000
 # If a model exists in InvokeAI, create a symlink instead of downloading
 invokeai_db: /mnt/llm/hub/invokeai_data/databases/invokeai.db
 invokeai_models_dir: /mnt/llm/hub/invokeai_data/models
+
+# SHA256 hash index settings
+# Number of parallel workers for computing SHA256 hashes (default: 8)
+# Higher values speed up initial index build but use more CPU
+parallel_hash_workers: 8
