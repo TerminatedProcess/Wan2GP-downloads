@@ -1179,7 +1179,7 @@ def render_models_tab():
     display_columns = ['Config', 'Model File', 'Size (GB)', 'Source', 'Status', 'Dest']
     st.dataframe(
         df[display_columns],
-        height=735,
+        width="stretch",
         selection_mode="multi-row",
         on_select="rerun",
         key="model_table",
@@ -1299,7 +1299,7 @@ def render_queue_tab():
 
     st.dataframe(
         df,
-        height=600,
+        width="stretch",
         hide_index=True,
         column_config={
             'ID': st.column_config.NumberColumn(width="small"),
@@ -1321,6 +1321,22 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded"
     )
+
+    # CSS for responsive dataframe height
+    st.markdown("""
+        <style>
+        /* Make dataframe fill available vertical space */
+        .stDataFrame {
+            height: calc(100vh - 280px) !important;
+        }
+        .stDataFrame > div {
+            height: 100% !important;
+        }
+        .stDataFrame iframe {
+            height: 100% !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
 
     # Initialize queue table
     init_queue_table()
