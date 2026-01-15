@@ -41,6 +41,7 @@ class HashIndex:
                 sha256_hash TEXT,
                 file_path TEXT NOT NULL,
                 file_size INTEGER,
+                multifile INTEGER DEFAULT 0,
                 computed_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -54,6 +55,12 @@ class HashIndex:
             CREATE INDEX IF NOT EXISTS idx_blake3 ON hash_index(blake3_hash)
         ''')
 
+        # Migration: add multifile column if it doesn't exist
+        cursor.execute("PRAGMA table_info(hash_index)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if 'multifile' not in columns:
+            cursor.execute("ALTER TABLE hash_index ADD COLUMN multifile INTEGER DEFAULT 0")
+
         conn.commit()
         conn.close()
 
@@ -66,7 +73,7 @@ class HashIndex:
     def get_stats(self) -> Dict:
         """Get index statistics"""
         if not Path(self.db_path).exists():
-            return {'total': 0, 'computed': 0, 'pending': 0, 'exists': False}
+            return {'total': 0, 'computed': 0, 'pending': 0, 'multifile': 0, 'exists': False}
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -77,12 +84,20 @@ class HashIndex:
         cursor.execute("SELECT COUNT(*) FROM hash_index WHERE sha256_hash IS NOT NULL")
         computed = cursor.fetchone()[0]
 
+        cursor.execute("SELECT COUNT(*) FROM hash_index WHERE multifile = 1")
+        multifile = cursor.fetchone()[0]
+
+        # Pending = single files without hash (excludes multifile directories)
+        cursor.execute("SELECT COUNT(*) FROM hash_index WHERE multifile = 0 AND sha256_hash IS NULL")
+        pending = cursor.fetchone()[0]
+
         conn.close()
 
         return {
             'total': total,
             'computed': computed,
-            'pending': total - computed,
+            'pending': pending,
+            'multifile': multifile,
             'exists': True
         }
 
@@ -90,6 +105,31 @@ class HashIndex:
         """Check if all hashes have been computed"""
         stats = self.get_stats()
         return stats['exists'] and stats['pending'] == 0
+
+    def _migrate_multifile_flags(self):
+        """Update multifile flags for existing entries based on filesystem check"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Find entries that haven't been checked for multifile yet
+        # (multifile=0 but sha256_hash is NULL - could be a directory)
+        cursor.execute('''
+            SELECT id, file_path FROM hash_index
+            WHERE multifile = 0 AND sha256_hash IS NULL
+        ''')
+
+        to_check = cursor.fetchall()
+
+        for entry_id, file_path in to_check:
+            path = Path(file_path)
+            if path.exists() and path.is_dir():
+                cursor.execute(
+                    "UPDATE hash_index SET multifile = 1 WHERE id = ?",
+                    (entry_id,)
+                )
+
+        conn.commit()
+        conn.close()
 
     def sync_from_invokeai(self) -> int:
         """
@@ -128,15 +168,18 @@ class HashIndex:
 
             full_path = self.invokeai_models_dir / rel_path
 
-            # Get file size if file exists
+            # Determine if this is a multifile model (directory)
+            is_multifile = full_path.is_dir() if full_path.exists() else False
+
+            # Get file size if file exists (only for single files)
             file_size = None
-            if full_path.exists():
+            if full_path.exists() and not is_multifile:
                 file_size = full_path.stat().st_size
 
             cursor.execute('''
-                INSERT INTO hash_index (invokeai_id, blake3_hash, file_path, file_size)
-                VALUES (?, ?, ?, ?)
-            ''', (invokeai_id, blake3_hash, str(full_path), file_size))
+                INSERT INTO hash_index (invokeai_id, blake3_hash, file_path, file_size, multifile)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (invokeai_id, blake3_hash, str(full_path), file_size, 1 if is_multifile else 0))
             added += 1
 
         # Remove entries for deleted models
@@ -150,6 +193,9 @@ class HashIndex:
 
         conn.commit()
         conn.close()
+
+        # Migrate existing entries that might be directories
+        self._migrate_multifile_flags()
 
         return added
 
@@ -212,13 +258,14 @@ class HashIndex:
         """
         Compute SHA256 hashes for all pending entries using thread pool.
         Progress callback is called from main thread (Streamlit-safe).
+        Only processes single files (multifile=0) with missing hash.
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
         cursor.execute('''
             SELECT id, file_path, file_size FROM hash_index
-            WHERE sha256_hash IS NULL
+            WHERE multifile = 0 AND sha256_hash IS NULL
             ORDER BY file_size ASC
         ''')
 
@@ -267,6 +314,7 @@ class HashIndex:
         """
         Compute SHA256 hashes for all pending entries asynchronously.
         Uses semaphore to limit concurrent operations.
+        Only processes single files (multifile=0) with missing hash.
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -274,7 +322,7 @@ class HashIndex:
         # Order by file_size to process smaller files first (quicker feedback)
         cursor.execute('''
             SELECT id, file_path, file_size FROM hash_index
-            WHERE sha256_hash IS NULL
+            WHERE multifile = 0 AND sha256_hash IS NULL
             ORDER BY file_size ASC
         ''')
 
