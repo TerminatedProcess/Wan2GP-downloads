@@ -10,7 +10,7 @@ import asyncio
 import aiofiles
 from pathlib import Path
 from typing import Optional, Dict, List, Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 
@@ -211,7 +211,7 @@ class HashIndex:
     def compute_pending_hashes(self, progress_callback: Optional[Callable[[int, int, str], None]] = None):
         """
         Compute SHA256 hashes for all pending entries using thread pool.
-        This is the synchronous version for simpler integration.
+        Progress callback is called from main thread (Streamlit-safe).
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -226,33 +226,41 @@ class HashIndex:
         conn.close()
 
         if not pending:
-            return
+            return 0
 
         total = len(pending)
-        completed = 0
 
         def process_entry(entry):
-            nonlocal completed
+            """Process single entry - returns (entry_id, filename, sha256 or None)"""
             entry_id, file_path, file_size = entry
             filename = Path(file_path).name
-
             sha256 = self._compute_sha256(file_path)
-
-            if sha256:
-                self._update_hash(entry_id, sha256)
-
-            completed += 1
-
-            if progress_callback:
-                progress_callback(completed, total, filename)
-
-            return sha256 is not None
+            return (entry_id, filename, sha256)
 
         # Use thread pool for parallel processing
-        with ThreadPoolExecutor(max_workers=self.parallel_workers) as executor:
-            results = list(executor.map(process_entry, pending))
+        # Submit all tasks and process results as they complete
+        completed = 0
+        success_count = 0
 
-        return sum(results)
+        with ThreadPoolExecutor(max_workers=self.parallel_workers) as executor:
+            # Submit all tasks
+            futures = {executor.submit(process_entry, entry): entry for entry in pending}
+
+            # Process results as they complete (main thread handles progress)
+            for future in as_completed(futures):
+                entry_id, filename, sha256 = future.result()
+
+                if sha256:
+                    self._update_hash(entry_id, sha256)
+                    success_count += 1
+
+                completed += 1
+
+                # Progress callback runs in main thread - safe for Streamlit
+                if progress_callback:
+                    progress_callback(completed, total, filename)
+
+        return success_count
 
     async def compute_pending_hashes_async(self,
                                            progress_callback: Optional[Callable[[int, int, str], None]] = None):
