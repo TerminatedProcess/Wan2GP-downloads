@@ -197,6 +197,7 @@ class QueueProcessor:
                 filename TEXT NOT NULL,
                 config_name TEXT,
                 remote_size INTEGER,
+                hub_source_path TEXT,
                 status TEXT DEFAULT 'pending',
                 progress INTEGER DEFAULT 0,
                 speed_mbps REAL DEFAULT 0,
@@ -206,6 +207,12 @@ class QueueProcessor:
                 completed_at TIMESTAMP
             )
         ''')
+
+        # Migration: add hub_source_path column if it doesn't exist
+        cursor.execute("PRAGMA table_info(download_queue)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'hub_source_path' not in columns:
+            cursor.execute("ALTER TABLE download_queue ADD COLUMN hub_source_path TEXT")
 
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_queue_status
@@ -239,7 +246,7 @@ class QueueProcessor:
         cursor = conn.cursor()
 
         cursor.execute('''
-            SELECT id, url, output_path, filename, config_name, remote_size
+            SELECT id, url, output_path, filename, config_name, remote_size, hub_source_path
             FROM download_queue
             WHERE status = 'pending'
             ORDER BY created_at ASC
@@ -256,7 +263,8 @@ class QueueProcessor:
                 'output_path': row[2],
                 'filename': row[3],
                 'config_name': row[4],
-                'remote_size': row[5]
+                'remote_size': row[5],
+                'hub_source_path': row[6]
             }
         return None
 
@@ -367,14 +375,20 @@ class QueueProcessor:
 
             target.parent.mkdir(parents=True, exist_ok=True)
 
+            # Delete existing file/symlink
             if target.exists() or target.is_symlink():
+                print(f"    Deleting existing: {target} (symlink={target.is_symlink()})")
                 target.unlink()
 
             target.symlink_to(source)
 
+            # Verify the symlink was created correctly
             if target.is_symlink() and target.exists():
+                print(f"    Created symlink: {target} -> {source}")
                 return True, "Symlink created successfully"
             else:
+                # Debug info
+                print(f"    VERIFY FAILED: is_symlink={target.is_symlink()}, exists={target.exists()}")
                 return False, f"Symlink verification failed for {target_path}"
 
         except Exception as e:
@@ -491,7 +505,14 @@ class QueueProcessor:
         return success, msg if not success else "Success"
 
     def process_job(self, job: Dict):
-        """Process a single download job"""
+        """Process a single download job.
+
+        Logic:
+        1. Check if model is available in InvokeAI hub (via hub_source_path or lookup)
+        2. If available in hub AND destination file/symlink exists → delete it
+        3. Create symlink from hub
+        4. If not in hub → download from HuggingFace
+        """
         job_id = job['id']
         filename = job['filename']
         self.current_job_id = job_id
@@ -505,20 +526,36 @@ class QueueProcessor:
             size_mb = job['remote_size'] / (1024 * 1024)
             print(f"  Size: {size_mb:.1f} MB")
 
-        # Check InvokeAI hub first - avoid download if model exists
-        if self.invokeai_enabled:
+        output_path = Path(job['output_path'])
+
+        # Check for hub path - either pre-stored or lookup
+        hub_path = job.get('hub_source_path')
+
+        if hub_path:
+            print(f"  Using pre-stored hub path: {Path(hub_path).name}")
+            if not Path(hub_path).exists():
+                print(f"  WARNING: Hub path no longer exists, will search...")
+                hub_path = None
+
+        if not hub_path and self.invokeai_enabled:
             print("  Checking InvokeAI hub...")
             hub_path = self.find_in_invokeai(job['url'])
-            if hub_path:
-                print(f"  Found in hub: {Path(hub_path).name}")
-                success, message = self.create_symlink(hub_path, job['output_path'])
-                if success:
-                    self.update_job_status(job_id, 'linked', 100, 0)
-                    print(f"  ✓ Linked from hub (no download needed)")
-                    self.current_job_id = None
-                    return
-                else:
-                    print(f"  Symlink failed: {message}, falling back to download...")
+
+        if hub_path:
+            # Model available in hub - delete existing and create symlink
+            print(f"  Found in hub: {Path(hub_path).name}")
+            if output_path.exists() or output_path.is_symlink():
+                print(f"  Removing existing: {output_path.name} (symlink={output_path.is_symlink()})")
+                output_path.unlink()
+
+            success, message = self.create_symlink(hub_path, job['output_path'])
+            if success:
+                self.update_job_status(job_id, 'linked', 100, 0)
+                print(f"  ✓ Linked from hub (no download needed)")
+                self.current_job_id = None
+                return
+            else:
+                print(f"  Symlink failed: {message}, falling back to download...")
 
         # Not in hub or symlink failed - proceed with download
         self.update_job_status(job_id, 'downloading', 0, 0)

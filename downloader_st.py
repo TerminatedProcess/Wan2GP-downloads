@@ -15,7 +15,6 @@ import threading
 import sqlite3
 import logging
 import subprocess
-import hashlib
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Dict, List, Tuple, Optional
@@ -757,6 +756,7 @@ def init_queue_table():
             filename TEXT NOT NULL,
             config_name TEXT,
             remote_size INTEGER,
+            hub_source_path TEXT,
             status TEXT DEFAULT 'pending',
             progress INTEGER DEFAULT 0,
             speed_mbps REAL DEFAULT 0,
@@ -766,6 +766,12 @@ def init_queue_table():
             completed_at TIMESTAMP
         )
     ''')
+
+    # Migration: add hub_source_path column if it doesn't exist
+    cursor.execute("PRAGMA table_info(download_queue)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if 'hub_source_path' not in columns:
+        cursor.execute("ALTER TABLE download_queue ADD COLUMN hub_source_path TEXT")
 
     cursor.execute('''
         CREATE INDEX IF NOT EXISTS idx_queue_status
@@ -794,9 +800,10 @@ def add_to_queue(items: List[Dict]) -> int:
             continue  # Skip if already queued
 
         cursor.execute('''
-            INSERT INTO download_queue (url, output_path, filename, config_name, remote_size, status)
-            VALUES (?, ?, ?, ?, ?, 'pending')
-        ''', (item['url'], item['output_path'], item['filename'], item.get('config', ''), item.get('remote_size')))
+            INSERT INTO download_queue (url, output_path, filename, config_name, remote_size, hub_source_path, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending')
+        ''', (item['url'], item['output_path'], item['filename'], item.get('config', ''),
+              item.get('remote_size'), item.get('hub_source_path')))
         added += 1
 
     conn.commit()
@@ -1128,18 +1135,22 @@ def render_models_tab():
     df = pd.DataFrame(df_data)
 
     # Handle selection BEFORE rendering buttons
-    if 'model_table' in st.session_state:
+    if 'model_table' in st.session_state and not df.empty:
         if 'selection' in st.session_state.model_table and 'rows' in st.session_state.model_table.selection:
             selected_rows = st.session_state.model_table.selection['rows']
-            st.session_state.selected_items = set(df.iloc[selected_rows]['_output_path'].tolist())
+            # Filter to only valid row indices
+            valid_rows = [r for r in selected_rows if r < len(df)]
+            if valid_rows and '_output_path' in df.columns:
+                st.session_state.selected_items = set(df.iloc[valid_rows]['_output_path'].tolist())
 
     # Compact action bar
     col1, col2, col3, col4, col5 = st.columns([1, 1, 2, 1, 2])
 
     with col1:
-        if st.button("Select All", width="stretch", key="select_all"):
-            st.session_state.selected_items = set(df['_output_path'].tolist())
-            st.rerun()
+        if st.button("Select All", width="stretch", key="select_all", disabled=df.empty):
+            if not df.empty and '_output_path' in df.columns:
+                st.session_state.selected_items = set(df['_output_path'].tolist())
+                st.rerun()
 
     with col2:
         if st.button("Clear", width="stretch", key="clear_all"):
@@ -1201,14 +1212,17 @@ def render_models_tab():
 
     # Display table - hide internal columns
     display_columns = ['Config', 'Model File', 'Size (GB)', 'Source', 'Status', 'Dest']
-    st.dataframe(
-        df[display_columns],
-        width="stretch",
-        selection_mode="multi-row",
-        on_select="rerun",
-        key="model_table",
-        hide_index=True
-    )
+    if df.empty:
+        st.info("No models match the current filter.")
+    else:
+        st.dataframe(
+            df[display_columns],
+            width="stretch",
+            selection_mode="multi-row",
+            on_select="rerun",
+            key="model_table",
+            hide_index=True
+        )
 
 
 @st.fragment(run_every="3s")
@@ -1308,41 +1322,24 @@ def render_queue_status():
     )
 
 
-def compute_file_sha256(file_path: Path) -> Optional[str]:
-    """Compute SHA256 hash of a local file"""
-    if not file_path.exists() or file_path.is_dir():
-        return None
-    try:
-        sha256 = hashlib.sha256()
-        with open(file_path, 'rb') as f:
-            while chunk := f.read(8 * 1024 * 1024):  # 8MB chunks
-                sha256.update(chunk)
-        return sha256.hexdigest()
-    except (IOError, OSError):
-        return None
-
-
-def queue_hub_models() -> Tuple[int, int]:
+def queue_hub_models() -> int:
     """
-    Queue all models that exist in the InvokeAI hub.
-    For each model found in hub:
-    1. Delete existing file in Wan2GP destination (symlink or full file)
-    2. Add to download queue (will be re-symlinked by processor)
+    Queue models that exist in InvokeAI hub for symlinking.
 
-    Uses multiple matching strategies:
-    1. SHA256 hash from HuggingFace metadata
-    2. URL matching in InvokeAI database
-    3. For physical files: compute actual SHA256 and match against hub
+    For each model in the download queue:
+    1. Look up SHA256 hash from cached HuggingFace metadata (LFS OID)
+    2. Find matching file in InvokeAI via hash_index lookup
+    3. If found, add to download queue with hub_source_path set
 
-    Returns (queued_count, deleted_count)
+    The queue processor will handle deleting existing files and creating symlinks.
+
+    Returns: number of items added to queue
     """
     downloader = st.session_state.downloader
 
     if not downloader.invokeai_enabled:
-        return 0, 0
+        return 0
 
-    queued_count = 0
-    deleted_count = 0
     queue_items = []
 
     for item in st.session_state.download_queue:
@@ -1350,9 +1347,8 @@ def queue_hub_models() -> Tuple[int, int]:
             continue
 
         output_path = Path(item['output_path'])
-        invokeai_path = None
 
-        # Strategy 1: Try URL/HF-hash matching first
+        # Look up SHA256 hash from cached HuggingFace API response
         repo_id, filename = downloader.parse_hf_url(item['url'])
         sha256_hash = None
         if repo_id and filename:
@@ -1361,45 +1357,24 @@ def queue_hub_models() -> Tuple[int, int]:
             if cache_result['found'] and cache_result['data']:
                 sha256_hash = cache_result['data'].get('hash')
 
+        # Find matching model in InvokeAI hub via hash or URL
         invokeai_path = downloader.find_in_invokeai(item['url'], sha256_hash=sha256_hash)
 
-        # Strategy 2: If no match and physical file exists, compute its hash and lookup
-        if not invokeai_path and output_path.exists() and not output_path.is_symlink():
-            # Physical file exists - compute its actual SHA256
-            file_hash = compute_file_sha256(output_path)
-            if file_hash and downloader.hash_index:
-                result = downloader.hash_index.lookup_by_sha256(file_hash)
-                if result:
-                    invokeai_path = result.get('file_path')
-                    if invokeai_path and Path(invokeai_path).exists():
-                        logging.info(f"Matched {output_path.name} via content hash")
-                    else:
-                        invokeai_path = None
-
         if invokeai_path:
-            # Delete existing file if it exists (symlink or full file)
-            if output_path.exists() or output_path.is_symlink():
-                try:
-                    output_path.unlink()
-                    deleted_count += 1
-                    # Reset status since file is gone
-                    item['status'] = '---'
-                except Exception as e:
-                    logging.error(f"Failed to delete {output_path}: {e}")
-
-            # Add to queue
+            # Add to queue with hub path - processor will create symlink
             queue_items.append({
                 'url': item['url'],
-                'output_path': item['output_path'],
+                'output_path': str(output_path),
                 'filename': item['filename'],
                 'config': item.get('config', ''),
-                'remote_size': item.get('remote_size')
+                'remote_size': item.get('remote_size'),
+                'hub_source_path': invokeai_path
             })
 
     if queue_items:
-        queued_count = add_to_queue(queue_items)
+        return add_to_queue(queue_items)
 
-    return queued_count, deleted_count
+    return 0
 
 
 def render_queue_tab():
@@ -1409,9 +1384,9 @@ def render_queue_tab():
 
     with col1:
         if st.button("Queue Hub", width="stretch", type="primary", key="queue_hub"):
-            with st.spinner("Finding hub models (computing hashes for physical files)..."):
-                queued, deleted = queue_hub_models()
-            st.toast(f"Queued {queued} hub models, deleted {deleted} existing files")
+            with st.spinner("Finding hub models..."):
+                queued = queue_hub_models()
+            st.toast(f"Queued {queued} hub models")
 
     with col2:
         if st.button("Clear Complete", width="stretch", key="clear_complete"):
