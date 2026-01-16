@@ -15,6 +15,7 @@ import threading
 import sqlite3
 import logging
 import subprocess
+import hashlib
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Dict, List, Tuple, Optional
@@ -855,12 +856,13 @@ def get_queue_stats() -> Dict:
     stats = dict(cursor.fetchall())
     conn.close()
 
+    # Combine 'complete' and 'linked' as both are successful completions
+    complete_count = stats.get('complete', 0) + stats.get('linked', 0)
     return {
         'pending': stats.get('pending', 0),
         'downloading': stats.get('downloading', 0),
-        'complete': stats.get('complete', 0),
-        'failed': stats.get('failed', 0),
-        'linked': stats.get('linked', 0)
+        'complete': complete_count,
+        'failed': stats.get('failed', 0)
     }
 
 
@@ -870,7 +872,11 @@ def clear_queue(status_filter: str = None):
     cursor = conn.cursor()
 
     if status_filter:
-        cursor.execute("DELETE FROM download_queue WHERE status = ?", (status_filter,))
+        # 'complete' filter should also clear 'linked' entries (both are successful)
+        if status_filter == 'complete':
+            cursor.execute("DELETE FROM download_queue WHERE status IN ('complete', 'linked')")
+        else:
+            cursor.execute("DELETE FROM download_queue WHERE status = ?", (status_filter,))
     else:
         cursor.execute("DELETE FROM download_queue")
 
@@ -1302,30 +1308,130 @@ def render_queue_status():
     )
 
 
+def compute_file_sha256(file_path: Path) -> Optional[str]:
+    """Compute SHA256 hash of a local file"""
+    if not file_path.exists() or file_path.is_dir():
+        return None
+    try:
+        sha256 = hashlib.sha256()
+        with open(file_path, 'rb') as f:
+            while chunk := f.read(8 * 1024 * 1024):  # 8MB chunks
+                sha256.update(chunk)
+        return sha256.hexdigest()
+    except (IOError, OSError):
+        return None
+
+
+def queue_hub_models() -> Tuple[int, int]:
+    """
+    Queue all models that exist in the InvokeAI hub.
+    For each model found in hub:
+    1. Delete existing file in Wan2GP destination (symlink or full file)
+    2. Add to download queue (will be re-symlinked by processor)
+
+    Uses multiple matching strategies:
+    1. SHA256 hash from HuggingFace metadata
+    2. URL matching in InvokeAI database
+    3. For physical files: compute actual SHA256 and match against hub
+
+    Returns (queued_count, deleted_count)
+    """
+    downloader = st.session_state.downloader
+
+    if not downloader.invokeai_enabled:
+        return 0, 0
+
+    queued_count = 0
+    deleted_count = 0
+    queue_items = []
+
+    for item in st.session_state.download_queue:
+        if not item['url'].startswith('http'):
+            continue
+
+        output_path = Path(item['output_path'])
+        invokeai_path = None
+
+        # Strategy 1: Try URL/HF-hash matching first
+        repo_id, filename = downloader.parse_hf_url(item['url'])
+        sha256_hash = None
+        if repo_id and filename:
+            cache_key = f"{repo_id}/{filename}"
+            cache_result = downloader.get_cached_file_info(cache_key)
+            if cache_result['found'] and cache_result['data']:
+                sha256_hash = cache_result['data'].get('hash')
+
+        invokeai_path = downloader.find_in_invokeai(item['url'], sha256_hash=sha256_hash)
+
+        # Strategy 2: If no match and physical file exists, compute its hash and lookup
+        if not invokeai_path and output_path.exists() and not output_path.is_symlink():
+            # Physical file exists - compute its actual SHA256
+            file_hash = compute_file_sha256(output_path)
+            if file_hash and downloader.hash_index:
+                result = downloader.hash_index.lookup_by_sha256(file_hash)
+                if result:
+                    invokeai_path = result.get('file_path')
+                    if invokeai_path and Path(invokeai_path).exists():
+                        logging.info(f"Matched {output_path.name} via content hash")
+                    else:
+                        invokeai_path = None
+
+        if invokeai_path:
+            # Delete existing file if it exists (symlink or full file)
+            if output_path.exists() or output_path.is_symlink():
+                try:
+                    output_path.unlink()
+                    deleted_count += 1
+                    # Reset status since file is gone
+                    item['status'] = '---'
+                except Exception as e:
+                    logging.error(f"Failed to delete {output_path}: {e}")
+
+            # Add to queue
+            queue_items.append({
+                'url': item['url'],
+                'output_path': item['output_path'],
+                'filename': item['filename'],
+                'config': item.get('config', ''),
+                'remote_size': item.get('remote_size')
+            })
+
+    if queue_items:
+        queued_count = add_to_queue(queue_items)
+
+    return queued_count, deleted_count
+
+
 def render_queue_tab():
     """Render the Queue tab content"""
     # Action buttons (outside fragment so they don't auto-refresh)
-    col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 2])
+    col1, col2, col3, col4, col5, col6 = st.columns([1, 1, 1, 1, 1, 1])
 
     with col1:
+        if st.button("Queue Hub", width="stretch", type="primary", key="queue_hub"):
+            with st.spinner("Finding hub models (computing hashes for physical files)..."):
+                queued, deleted = queue_hub_models()
+            st.toast(f"Queued {queued} hub models, deleted {deleted} existing files")
+
+    with col2:
         if st.button("Clear Complete", width="stretch", key="clear_complete"):
             clear_queue('complete')
             st.toast("Cleared completed items")
 
-    with col2:
+    with col3:
         if st.button("Clear Failed", width="stretch", key="clear_failed"):
             clear_queue('failed')
             st.toast("Cleared failed items")
 
-    with col3:
+    with col4:
         if st.button("Clear All", width="stretch", key="clear_all_queue"):
             clear_queue()
             st.toast("Cleared all queue items")
 
-    with col4:
+    with col5:
         st.caption("Auto-refresh: 3s")
 
-    with col5:
+    with col6:
         st.write("")
 
     st.divider()

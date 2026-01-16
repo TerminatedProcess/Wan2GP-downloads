@@ -127,6 +127,29 @@ class QueueProcessor:
         self.cache_dir = self.wan2gp_dir / "ckpts"
         self.bandwidth_limit = self.config.get("bandwidth_limit_kb", 90000)
 
+        # InvokeAI integration
+        self.invokeai_db = Path(self.config.get("invokeai_db", "")) if self.config.get("invokeai_db") else None
+        self.invokeai_models_dir = Path(self.config.get("invokeai_models_dir", "")) if self.config.get("invokeai_models_dir") else None
+        self.invokeai_enabled = (
+            self.invokeai_db is not None and
+            self.invokeai_db.exists() and
+            self.invokeai_models_dir is not None and
+            self.invokeai_models_dir.exists()
+        )
+
+        # Hash index for SHA256 lookups
+        self.hash_index = None
+        if self.invokeai_enabled:
+            try:
+                from hash_index import HashIndex
+                self.hash_index = HashIndex(
+                    str(self.invokeai_db),
+                    str(self.invokeai_models_dir),
+                    self.config.get("parallel_hash_workers", 8)
+                )
+            except ImportError:
+                pass
+
         # HuggingFace API
         self.hf_api = HfApi()
 
@@ -265,6 +288,56 @@ class QueueProcessor:
 
         conn.commit()
         conn.close()
+
+    def find_in_invokeai(self, url: str, sha256_hash: str = None) -> Optional[str]:
+        """Find model in InvokeAI database by SHA256 hash, source URL, or filename.
+
+        Priority:
+        1. SHA256 hash lookup (most reliable, hash-based matching)
+        2. Source URL exact match (legacy fallback)
+        3. Filename pattern match (last resort)
+        """
+        if not self.invokeai_enabled:
+            return None
+
+        # Priority 1: SHA256 hash lookup via hash index
+        if sha256_hash and self.hash_index:
+            try:
+                result = self.hash_index.lookup_by_sha256(sha256_hash)
+                if result:
+                    file_path = Path(result['file_path'])
+                    if file_path.exists():
+                        return str(file_path)
+            except Exception:
+                pass
+
+        # Priority 2 & 3: URL and filename fallback
+        try:
+            conn = sqlite3.connect(str(self.invokeai_db))
+            cursor = conn.cursor()
+
+            # Try exact source URL match
+            cursor.execute("SELECT path FROM models WHERE source = ?", (url,))
+            result = cursor.fetchone()
+
+            if not result:
+                # Try filename pattern match
+                filename = Path(urlparse(url).path).name
+                cursor.execute("SELECT path FROM models WHERE source LIKE ?", (f"%/{filename}",))
+                result = cursor.fetchone()
+
+            conn.close()
+
+            if result:
+                relative_path = result[0]
+                full_path = self.invokeai_models_dir / relative_path
+                if full_path.exists():
+                    return str(full_path)
+            return None
+
+        except Exception as e:
+            print(f"  Error querying InvokeAI database: {e}")
+            return None
 
     def parse_hf_url(self, url: str) -> tuple:
         """Parse HuggingFace URL to extract repo_id and filename"""
@@ -432,6 +505,22 @@ class QueueProcessor:
             size_mb = job['remote_size'] / (1024 * 1024)
             print(f"  Size: {size_mb:.1f} MB")
 
+        # Check InvokeAI hub first - avoid download if model exists
+        if self.invokeai_enabled:
+            print("  Checking InvokeAI hub...")
+            hub_path = self.find_in_invokeai(job['url'])
+            if hub_path:
+                print(f"  Found in hub: {Path(hub_path).name}")
+                success, message = self.create_symlink(hub_path, job['output_path'])
+                if success:
+                    self.update_job_status(job_id, 'linked', 100, 0)
+                    print(f"  ✓ Linked from hub (no download needed)")
+                    self.current_job_id = None
+                    return
+                else:
+                    print(f"  Symlink failed: {message}, falling back to download...")
+
+        # Not in hub or symlink failed - proceed with download
         self.update_job_status(job_id, 'downloading', 0, 0)
 
         success, message = self.download_file(job)
@@ -477,6 +566,10 @@ class QueueProcessor:
         print(f"Config: {self.config.get('wan2gp_directory', '../Wan2GP-mryan')}")
         print(f"Bandwidth limit: {self.bandwidth_limit} KB/s ({self.bandwidth_limit/1024:.0f} MB/s)")
         print(f"Poll interval: {self.poll_interval} seconds")
+        if self.invokeai_enabled:
+            print(f"InvokeAI Hub: ✓ Enabled (models linked from hub skip download)")
+        else:
+            print(f"InvokeAI Hub: ✗ Disabled")
         print("-" * 60)
 
         # Reset any interrupted downloads from previous runs
@@ -493,7 +586,8 @@ class QueueProcessor:
 
                 # Show queue stats after each job
                 stats = self.get_queue_stats()
-                print(f"\n  Queue: {stats['pending']} pending, {stats['complete']} complete, {stats['failed']} failed")
+                linked_str = f", {stats['linked']} linked" if stats['linked'] > 0 else ""
+                print(f"\n  Queue: {stats['pending']} pending, {stats['complete']} complete{linked_str}, {stats['failed']} failed")
             else:
                 # No jobs, wait and poll again
                 for _ in range(self.poll_interval):
