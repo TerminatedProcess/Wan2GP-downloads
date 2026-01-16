@@ -4,112 +4,90 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-WanGP Smart Model Downloader - A Python web application for downloading AI models from HuggingFace with intelligent hub integration. It avoids duplicate downloads by creating symlinks to existing files in a local model hub (InvokeAI).
+WanGP Smart Model Downloader - Downloads AI models from HuggingFace for Wan2GP video generation. Uses SHA256 hash matching to avoid duplicate downloads by creating symlinks to existing files in a local model hub (InvokeAI).
 
 ## Commands
 
-### Setup
 ```bash
-# Create virtual environment and install dependencies
-source .salias
-mkenv
-install
-```
+# Setup (after source .salias)
+mkenv                          # Create .venv with Python 3.12.10
+install                        # Install dependencies via uv
 
-### Running
-```bash
-# Streamlit web UI (primary usage)
-run
-# or: uv run streamlit run downloader_st.py
+# Running
+run                            # Start Streamlit web UI (primary interface)
+queue                          # Start queue processor (separate terminal)
+qs                             # Check queue status
+hfk                            # Kill queue processor
+stop                           # Stop Streamlit
 
-# Queue processor (run in separate terminal)
-queue
-# or: uv run python hfqueue.py
-
-# Queue status check
-qs
-# or: uv run python hfqueue.py --status
-
-# Clear queue
+# Direct commands
+uv run streamlit run downloader_st.py
+uv run python hfqueue.py
+uv run python hfqueue.py --status
 uv run python hfqueue.py --clear
+
+# Hash index (CLI)
+uv run python hash_index.py --status    # Show hash index stats
+uv run python hash_index.py --rebuild   # Rebuild from scratch
 ```
 
 ## Architecture
 
-### Core Components
+```
+User → Streamlit UI → SQLite queue → hfqueue.py → HuggingFace/InvokeAI → symlink
+```
 
-**`downloader_st.py`** - Streamlit web application:
-- `ModelDownloader` class: Core download logic, HuggingFace API integration, symlink creation
-- Streamlit UI with tabs for Models and Queue
-- Queue management functions for adding/viewing/clearing jobs
+**Two-process design**: Streamlit handles UI/selection, `hfqueue.py` handles downloads independently. Communication via SQLite `download_queue` table.
 
-**`hfqueue.py`** - Standalone queue processor:
-- Runs independently from Streamlit
-- Monitors SQLite queue table and processes downloads
-- Console output with progress bars
-- Can be launched from command line
+### Core Files
 
-### Data Flow
+| File | Purpose |
+|------|---------|
+| `downloader_st.py` | Streamlit web UI, `ModelDownloader` class, queue management |
+| `hfqueue.py` | Standalone download processor with progress bars |
+| `hash_index.py` | SHA256 index for InvokeAI models (`HashIndex` class) |
+| `downloader.py` | Legacy Textual TUI (not queue-based) |
 
-1. User selects models in Streamlit → adds to queue table
-2. `hfqueue.py` polls queue table → downloads pending jobs
-3. Downloads go to HuggingFace cache → symlinks created to output paths
-4. User clicks Refresh in Queue tab to see progress
+### Model Resolution Priority
 
-### Key Patterns
+1. **SHA256 hash match** - HuggingFace LFS OID → `hash_sha256.db` lookup
+2. **URL exact match** - Source URL in InvokeAI's `models.source` column
+3. **Filename match** - Last resort pattern matching
+4. **Download** - If nothing found, download from HuggingFace
 
-- **Queue-based**: Downloads run in separate process, don't block web UI
-- **Symlink-first**: Creates symlinks from InvokeAI rather than downloading duplicates
-- **SQLite caching**: `hfcache.db` stores HF API metadata and download queue
-- **Bandwidth limiting**: Configurable download speed limits
+### Database Files
+
+| File | Tables | Purpose |
+|------|--------|---------|
+| `hfcache.db` | `hf_file_cache`, `download_queue` | HF metadata cache + job queue |
+| `hash_sha256.db` | `hash_index` | SHA256→file path mapping for InvokeAI |
 
 ### Configuration
 
-`config.yaml`:
-```yaml
-# Path to Wan2GP installation (where defaults/ and ckpts/ are located)
-wan2gp_directory: ../Wan2GP-mryan
+`config.yaml` keys:
+- `wan2gp_directory`: Path to Wan2GP (reads `defaults/*.json` for model URLs)
+- `bandwidth_limit_kb`: Download speed limit (KB/s)
+- `invokeai_db`: Path to InvokeAI's `invokeai.db`
+- `invokeai_models_dir`: Path to InvokeAI's models directory
+- `parallel_hash_workers`: Threads for SHA256 computation (default: 8)
 
-# Bandwidth limit in KB/s (90000 = ~90 MB/s)
-bandwidth_limit_kb: 90000
+### Key Classes
 
-# InvokeAI integration - create symlinks to existing models instead of re-downloading
-invokeai_db: /mnt/llm/hub/invokeai_data/databases/invokeai.db
-invokeai_models_dir: /mnt/llm/hub/invokeai_data/models
-```
+**`ModelDownloader`** (`downloader_st.py`):
+- `build_download_queue()`: Scans `defaults/*.json`, resolves URLs, checks InvokeAI
+- `find_in_invokeai()`: Multi-strategy model lookup
+- `create_symlink()`: Safe symlink creation with verification
 
-### InvokeAI Integration
+**`QueueProcessor`** (`hfqueue.py`):
+- `get_next_job()`: FIFO from `download_queue` table
+- `process_job()`: Check hub first, download if needed
+- `download_file()`: Threaded download with progress polling
 
-The downloader queries InvokeAI's SQLite database to find existing models. If a model exists in InvokeAI, a symlink is created instead of downloading.
+**`HashIndex`** (`hash_index.py`):
+- `sync_from_invokeai()`: Import models from InvokeAI DB
+- `compute_pending_hashes()`: Parallel SHA256 computation
+- `lookup_by_sha256()`: Fast hash-to-path lookup
 
-- First tries exact `source` URL match in InvokeAI's `models` table
-- Falls back to filename matching (for locally imported models)
-- Creates symlinks from `invokeai_models_dir/{uuid}/model.safetensors` to Wan2GP's `ckpts/`
+### HIGH/LOW Model Pairing
 
-### Streamlit UI Features
-
-**Models Tab:**
-- Filter bar for searching models by filename
-- Select All / Clear buttons
-- "Add to Queue" to queue selected models
-- Toggle to show all files vs missing only
-
-**Queue Tab:**
-- Status metrics (pending, downloading, complete, failed)
-- Refresh button to update view
-- Clear Complete/Failed/All buttons
-- Queue items table with progress and speed
-
-### Database Schema
-
-`hfcache.db` contains two tables:
-- `hf_file_cache`: Cached HuggingFace API metadata
-- `download_queue`: Job queue with status, progress, timestamps
-
-## Dependencies
-
-- **streamlit**: Web UI framework
-- **pandas**: Data display in tables
-- **huggingface_hub**: HF API and downloads
-- **httpx/requests**: HTTP with bandwidth limiting
-- **pyyaml**: YAML config parsing
+Models with both high-precision (bf16/fp16) and quantized (quanto) variants are grouped in the UI. The `group_high_low_models()` function pairs configs with exactly 2 files into single selectable rows.
