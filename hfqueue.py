@@ -5,10 +5,6 @@ Standalone process that monitors and processes download queue independently.
 Can be launched from command line or by Streamlit.
 """
 
-import os
-import sys
-import json
-import yaml
 import time
 import sqlite3
 import signal
@@ -17,107 +13,20 @@ import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List
-from urllib.parse import urlparse
 
-import requests
-import httpx
 from huggingface_hub import hf_hub_download, HfApi
 
-try:
-    from huggingface_hub import set_client_factory
-except ImportError:
-    try:
-        from huggingface_hub import configure_http_backend
-        set_client_factory = None
-    except ImportError:
-        set_client_factory = None
-        configure_http_backend = None
-
-
-# Queue database path (shared with Streamlit app)
-QUEUE_DB_PATH = "hfcache.db"
-
-
-class BandwidthLimitedSession(requests.Session):
-    """Requests session with bandwidth limiting"""
-
-    def __init__(self, max_bytes_per_second: Optional[int] = None):
-        super().__init__()
-        self.max_bytes_per_second = max_bytes_per_second
-
-    def request(self, method, url, **kwargs):
-        response = super().request(method, url, **kwargs)
-
-        if (self.max_bytes_per_second and
-            hasattr(response, 'headers') and
-            response.headers.get('content-length') and
-            int(response.headers.get('content-length', 0)) > 1024 * 1024):
-
-            original_iter_content = response.iter_content
-
-            def throttled_iter_content(chunk_size=1024, decode_unicode=False):
-                start_time = time.time()
-                bytes_downloaded = 0
-
-                for chunk in original_iter_content(chunk_size=chunk_size, decode_unicode=decode_unicode):
-                    if chunk:
-                        bytes_downloaded += len(chunk)
-                        yield chunk
-
-                        elapsed = time.time() - start_time
-                        if elapsed > 0:
-                            expected_time = bytes_downloaded / self.max_bytes_per_second
-                            if expected_time > elapsed:
-                                time.sleep(expected_time - elapsed)
-
-            response.iter_content = throttled_iter_content
-
-        return response
-
-
-class BandwidthLimitedTransport(httpx.HTTPTransport):
-    """HTTPX transport with bandwidth limiting"""
-
-    def __init__(self, max_bytes_per_second: Optional[int] = None, **kwargs):
-        super().__init__(**kwargs)
-        self.max_bytes_per_second = max_bytes_per_second
-        self._start_time = None
-        self._bytes_downloaded = 0
-
-    def handle_request(self, request):
-        self._start_time = time.time()
-        self._bytes_downloaded = 0
-
-        response = super().handle_request(request)
-
-        content_length = response.headers.get('content-length')
-        if (self.max_bytes_per_second and content_length and
-            int(content_length) > 1024 * 1024):
-
-            original_stream = response.stream
-
-            def throttled_stream():
-                for chunk in original_stream:
-                    if chunk:
-                        self._bytes_downloaded += len(chunk)
-                        yield chunk
-
-                        elapsed = time.time() - self._start_time
-                        if elapsed > 0:
-                            expected_time = self._bytes_downloaded / self.max_bytes_per_second
-                            if expected_time > elapsed:
-                                time.sleep(expected_time - elapsed)
-
-            response.stream = throttled_stream()
-
-        return response
+from shared import (
+    QUEUE_DB_PATH, parse_hf_url, create_symlink, find_in_invokeai,
+    load_config, init_queue_table,
+)
 
 
 class QueueProcessor:
     """Processes download queue from database"""
 
     def __init__(self, config_file: str = "config.yaml", poll_interval: int = 5):
-        self.config = self.load_config(config_file)
+        self.config = load_config(config_file, create_if_missing=False)
         self.poll_interval = poll_interval
         self.running = True
         self.current_job_id = None
@@ -153,9 +62,6 @@ class QueueProcessor:
         # HuggingFace API
         self.hf_api = HfApi()
 
-        # Configure bandwidth-limited HTTP backend
-        self._configure_bandwidth_limit()
-
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -164,63 +70,6 @@ class QueueProcessor:
         """Handle shutdown signals gracefully"""
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Received shutdown signal, finishing current job...")
         self.running = False
-
-    def _configure_bandwidth_limit(self):
-        """Configure bandwidth limiting for HuggingFace downloads"""
-        # Note: Bandwidth limiting via custom transport can interfere with
-        # HuggingFace's retry mechanism. For now, we skip custom transport
-        # and rely on system-level throttling if needed (e.g., trickle, tc).
-        # The bandwidth_limit config is still read but not applied at HTTP level.
-        pass
-
-    def load_config(self, config_file: str) -> dict:
-        """Load configuration from YAML file"""
-        try:
-            config_path = Path(config_file)
-            if config_path.exists():
-                with open(config_path, 'r') as f:
-                    return yaml.safe_load(f) or {}
-        except Exception as e:
-            print(f"Error loading config: {e}")
-        return {"wan2gp_directory": "../Wan2GP-mryan", "bandwidth_limit_kb": 90000}
-
-    def init_queue_table(self):
-        """Initialize the download queue table if it doesn't exist"""
-        conn = sqlite3.connect(QUEUE_DB_PATH)
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS download_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                url TEXT NOT NULL,
-                output_path TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                config_name TEXT,
-                remote_size INTEGER,
-                hub_source_path TEXT,
-                status TEXT DEFAULT 'pending',
-                progress INTEGER DEFAULT 0,
-                speed_mbps REAL DEFAULT 0,
-                error_message TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                started_at TIMESTAMP,
-                completed_at TIMESTAMP
-            )
-        ''')
-
-        # Migration: add hub_source_path column if it doesn't exist
-        cursor.execute("PRAGMA table_info(download_queue)")
-        columns = [row[1] for row in cursor.fetchall()]
-        if 'hub_source_path' not in columns:
-            cursor.execute("ALTER TABLE download_queue ADD COLUMN hub_source_path TEXT")
-
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_queue_status
-            ON download_queue(status)
-        ''')
-
-        conn.commit()
-        conn.close()
 
     def reset_stale_downloads(self):
         """Reset any 'downloading' jobs back to 'pending' on startup"""
@@ -297,102 +146,13 @@ class QueueProcessor:
         conn.commit()
         conn.close()
 
-    def find_in_invokeai(self, url: str, sha256_hash: str = None) -> Optional[str]:
-        """Find model in InvokeAI database by SHA256 hash, source URL, or filename.
-
-        Priority:
-        1. SHA256 hash lookup (most reliable, hash-based matching)
-        2. Source URL exact match (legacy fallback)
-        3. Filename pattern match (last resort)
-        """
+    def _find_in_invokeai(self, url: str, sha256_hash: str = None) -> Optional[str]:
+        """Find model in InvokeAI database. Delegates to shared.find_in_invokeai."""
         if not self.invokeai_enabled:
             return None
-
-        # Priority 1: SHA256 hash lookup via hash index
-        if sha256_hash and self.hash_index:
-            try:
-                result = self.hash_index.lookup_by_sha256(sha256_hash)
-                if result:
-                    file_path = Path(result['file_path'])
-                    if file_path.exists():
-                        return str(file_path)
-            except Exception:
-                pass
-
-        # Priority 2 & 3: URL and filename fallback
-        try:
-            conn = sqlite3.connect(str(self.invokeai_db))
-            cursor = conn.cursor()
-
-            # Try exact source URL match
-            cursor.execute("SELECT path FROM models WHERE source = ?", (url,))
-            result = cursor.fetchone()
-
-            if not result:
-                # Try filename pattern match
-                filename = Path(urlparse(url).path).name
-                cursor.execute("SELECT path FROM models WHERE source LIKE ?", (f"%/{filename}",))
-                result = cursor.fetchone()
-
-            conn.close()
-
-            if result:
-                relative_path = result[0]
-                full_path = self.invokeai_models_dir / relative_path
-                if full_path.exists():
-                    return str(full_path)
-            return None
-
-        except Exception as e:
-            print(f"  Error querying InvokeAI database: {e}")
-            return None
-
-    def parse_hf_url(self, url: str) -> tuple:
-        """Parse HuggingFace URL to extract repo_id and filename"""
-        try:
-            if 'huggingface.co' not in url:
-                return None, None
-
-            parts = url.split('/')
-            if len(parts) < 7:
-                return None, None
-
-            repo_id = f"{parts[3]}/{parts[4]}"
-            filename = '/'.join(parts[7:])
-
-            return repo_id, filename
-        except Exception:
-            return None, None
-
-    def create_symlink(self, source_path: str, target_path: str) -> tuple:
-        """Create symlink from source to target"""
-        try:
-            target = Path(target_path).resolve()
-            source = Path(source_path).resolve()
-
-            if not source.exists():
-                return False, f"Source file does not exist: {source_path}"
-
-            target.parent.mkdir(parents=True, exist_ok=True)
-
-            # Delete existing file/symlink
-            if target.exists() or target.is_symlink():
-                print(f"    Deleting existing: {target} (symlink={target.is_symlink()})")
-                target.unlink()
-
-            target.symlink_to(source)
-
-            # Verify the symlink was created correctly
-            if target.is_symlink() and target.exists():
-                print(f"    Created symlink: {target} -> {source}")
-                return True, "Symlink created successfully"
-            else:
-                # Debug info
-                print(f"    VERIFY FAILED: is_symlink={target.is_symlink()}, exists={target.exists()}")
-                return False, f"Symlink verification failed for {target_path}"
-
-        except Exception as e:
-            return False, f"Symlink creation failed: {str(e)}"
+        return find_in_invokeai(self.invokeai_db, self.invokeai_models_dir,
+                                self.hash_index, url, sha256_hash=sha256_hash,
+                                verbose=True)
 
     def download_file(self, job: Dict) -> tuple:
         """Download a file from HuggingFace with progress tracking"""
@@ -405,7 +165,7 @@ class QueueProcessor:
         if Path(output_path).exists():
             return True, "File already exists"
 
-        repo_id, filename = self.parse_hf_url(url)
+        repo_id, filename = parse_hf_url(url)
         if not repo_id or not filename:
             return False, f"Failed to parse URL: {url}"
 
@@ -501,7 +261,7 @@ class QueueProcessor:
         if not Path(cached_file).exists():
             return False, f"HuggingFace returned non-existent file: {cached_file}"
 
-        success, msg = self.create_symlink(cached_file, output_path)
+        success, msg = create_symlink(cached_file, output_path, verbose=True)
         return success, msg if not success else "Success"
 
     def process_job(self, job: Dict):
@@ -539,7 +299,7 @@ class QueueProcessor:
 
         if not hub_path and self.invokeai_enabled:
             print("  Checking InvokeAI hub...")
-            hub_path = self.find_in_invokeai(job['url'])
+            hub_path = self._find_in_invokeai(job['url'])
 
         if hub_path:
             # Model available in hub - delete existing and create symlink
@@ -548,7 +308,7 @@ class QueueProcessor:
                 print(f"  Removing existing: {output_path.name} (symlink={output_path.is_symlink()})")
                 output_path.unlink()
 
-            success, message = self.create_symlink(hub_path, job['output_path'])
+            success, message = create_symlink(hub_path, job['output_path'], verbose=True)
             if success:
                 self.update_job_status(job_id, 'linked', 100, 0)
                 print(f"  ✓ Linked from hub (no download needed)")
@@ -595,7 +355,7 @@ class QueueProcessor:
 
     def run(self):
         """Main loop - poll queue and process jobs"""
-        self.init_queue_table()
+        init_queue_table()
 
         print("=" * 60)
         print("HuggingFace Download Queue Processor")

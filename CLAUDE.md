@@ -53,12 +53,13 @@ The Streamlit UI adds jobs to the queue; the queue processor polls for `pending`
 
 | File | Purpose |
 |------|---------|
+| `shared.py` | Shared utilities: bandwidth limiting, URL parsing, symlink creation, InvokeAI lookup, config loading, queue table init |
 | `downloader_st.py` | Streamlit web UI, `ModelDownloader` class, queue management functions |
 | `hfqueue.py` | Standalone download processor with progress bars (runs as separate process) |
 | `hash_index.py` | SHA256 index for InvokeAI models (`HashIndex` class) |
 | `downloader.py` | Legacy Textual TUI (not queue-based, pre-dates Streamlit version) |
 
-Both `downloader_st.py` and `hfqueue.py` contain duplicate `BandwidthLimited*` classes and `find_in_invokeai()`/`create_symlink()`/`parse_hf_url()` methods. They share the constant `QUEUE_DB_PATH = "hfcache.db"`.
+`shared.py` contains all code shared between `downloader_st.py` and `hfqueue.py`: `QUEUE_DB_PATH`, `BandwidthLimited*` classes, `parse_hf_url()`, `create_symlink()`, `find_in_invokeai()`, `load_config()`, and `init_queue_table()`.
 
 ### Model Resolution Priority
 

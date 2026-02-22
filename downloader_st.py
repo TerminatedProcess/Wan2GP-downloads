@@ -7,9 +7,6 @@ Clean web interface for downloading AI models from HuggingFace
 import os
 import sys
 import json
-import yaml
-import requests
-import httpx
 import time
 import threading
 import sqlite3
@@ -20,14 +17,16 @@ from urllib.parse import urlparse
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 
+import httpx
 import streamlit as st
 import pandas as pd
 from huggingface_hub import hf_hub_download, HfApi
 
 from hash_index import HashIndex
-
-# Queue database path (shared with hfqueue.py)
-QUEUE_DB_PATH = "hfcache.db"
+from shared import (
+    QUEUE_DB_PATH, BandwidthLimitedSession, BandwidthLimitedTransport,
+    parse_hf_url, create_symlink, find_in_invokeai, load_config, init_queue_table,
+)
 
 try:
     from huggingface_hub import set_client_factory
@@ -49,84 +48,9 @@ logging.basicConfig(
 )
 
 
-class BandwidthLimitedSession(requests.Session):
-    """Requests session with bandwidth limiting"""
-
-    def __init__(self, max_bytes_per_second: Optional[int] = None):
-        super().__init__()
-        self.max_bytes_per_second = max_bytes_per_second
-
-    def request(self, method, url, **kwargs):
-        response = super().request(method, url, **kwargs)
-
-        if (self.max_bytes_per_second and
-            hasattr(response, 'headers') and
-            response.headers.get('content-length') and
-            int(response.headers.get('content-length', 0)) > 1024 * 1024):
-
-            original_iter_content = response.iter_content
-
-            def throttled_iter_content(chunk_size=1024, decode_unicode=False):
-                start_time = time.time()
-                bytes_downloaded = 0
-
-                for chunk in original_iter_content(chunk_size=chunk_size, decode_unicode=decode_unicode):
-                    if chunk:
-                        bytes_downloaded += len(chunk)
-                        yield chunk
-
-                        elapsed = time.time() - start_time
-                        if elapsed > 0:
-                            expected_time = bytes_downloaded / self.max_bytes_per_second
-                            if expected_time > elapsed:
-                                time.sleep(expected_time - elapsed)
-
-            response.iter_content = throttled_iter_content
-
-        return response
-
-
-class BandwidthLimitedTransport(httpx.HTTPTransport):
-    """HTTPX transport with bandwidth limiting"""
-
-    def __init__(self, max_bytes_per_second: Optional[int] = None, **kwargs):
-        super().__init__(**kwargs)
-        self.max_bytes_per_second = max_bytes_per_second
-        self._start_time = None
-        self._bytes_downloaded = 0
-
-    def handle_request(self, request):
-        self._start_time = time.time()
-        self._bytes_downloaded = 0
-
-        response = super().handle_request(request)
-
-        content_length = response.headers.get('content-length')
-        if (self.max_bytes_per_second and content_length and
-            int(content_length) > 1024 * 1024):
-
-            original_stream = response.stream
-
-            def throttled_stream():
-                for chunk in original_stream:
-                    if chunk:
-                        self._bytes_downloaded += len(chunk)
-                        yield chunk
-
-                        elapsed = time.time() - self._start_time
-                        if elapsed > 0:
-                            expected_time = self._bytes_downloaded / self.max_bytes_per_second
-                            if expected_time > elapsed:
-                                time.sleep(expected_time - elapsed)
-
-            response.stream = throttled_stream()
-
-        return response
-
-
 class ModelDownloader:
     def __init__(self, hub_dir: str = None, bandwidth_limit: Optional[int] = None, cache_dir: str = None, config_file: str = "config.yaml"):
-        self.config = self.load_config(config_file)
+        self.config = load_config(config_file)
 
         self.wan2gp_dir = Path(self.config.get("wan2gp_directory", "../Wan2GP-mryan"))
         self.cache_dir = Path(cache_dir) if cache_dir else self.wan2gp_dir / "ckpts"
@@ -176,36 +100,6 @@ class ModelDownloader:
                 def create_session():
                     return BandwidthLimitedSession(max_bytes_per_second=self.bandwidth_limit * 1024)
                 configure_http_backend(backend_factory=create_session)
-
-    def load_config(self, config_file: str) -> dict:
-        """Load configuration from YAML or JSON file"""
-        try:
-            config_path = Path(config_file)
-            if config_path.exists():
-                with open(config_path, 'r') as f:
-                    if config_file.endswith('.yaml') or config_file.endswith('.yml'):
-                        return yaml.safe_load(f) or {}
-                    else:
-                        return json.load(f)
-            else:
-                default_config = self.create_default_config()
-                with open(config_path, 'w') as f:
-                    if config_file.endswith('.yaml') or config_file.endswith('.yml'):
-                        yaml.dump(default_config, f, default_flow_style=False)
-                    else:
-                        json.dump(default_config, f, indent=2)
-                return default_config
-        except Exception as e:
-            logging.error(f"Error loading config: {e}")
-            return self.create_default_config()
-
-    def create_default_config(self) -> dict:
-        """Create default configuration"""
-        return {
-            "wan2gp_directory": "../Wan2GP-mryan",
-            "bandwidth_limit_kb": 90000,
-            "hub_directory": "",
-        }
 
     def init_cache_db(self):
         """Initialize SQLite cache database"""
@@ -315,27 +209,9 @@ class ModelDownloader:
         except Exception as e:
             logging.error(f"Error clearing cache: {e}")
 
-    def parse_hf_url(self, url: str) -> Tuple[Optional[str], Optional[str]]:
-        """Parse HuggingFace URL to extract repo_id and filename"""
-        try:
-            if 'huggingface.co' not in url:
-                return None, None
-
-            parts = url.split('/')
-            if len(parts) < 7:
-                return None, None
-
-            repo_id = f"{parts[3]}/{parts[4]}"
-            filename = '/'.join(parts[7:])
-
-            return repo_id, filename
-
-        except Exception:
-            return None, None
-
     def get_hf_file_info(self, url: str) -> Optional[dict]:
         """Get file info from HuggingFace API with caching"""
-        repo_id, filename = self.parse_hf_url(url)
+        repo_id, filename = parse_hf_url(url)
         if not repo_id or not filename:
             return None
 
@@ -369,77 +245,12 @@ class ModelDownloader:
 
         return None
 
-    def find_in_invokeai(self, url: str, sha256_hash: str = None) -> Optional[str]:
-        """Find model in InvokeAI database by SHA256 hash, source URL, or filename.
-
-        Priority:
-        1. SHA256 hash lookup (most reliable, hash-based matching)
-        2. Source URL exact match (legacy fallback)
-        3. Filename pattern match (last resort)
-        """
+    def _find_in_invokeai(self, url: str, sha256_hash: str = None) -> Optional[str]:
+        """Find model in InvokeAI database. Delegates to shared.find_in_invokeai."""
         if not self.invokeai_enabled:
             return None
-
-        # Priority 1: SHA256 hash lookup via hash index
-        if sha256_hash and self.hash_index and self.hash_index.is_ready():
-            result = self.hash_index.lookup_by_sha256(sha256_hash)
-            if result:
-                file_path = Path(result['file_path'])
-                if file_path.exists():
-                    logging.info(f"Found model via SHA256: {file_path.name}")
-                    return str(file_path)
-
-        # Priority 2 & 3: URL and filename fallback
-        try:
-            conn = sqlite3.connect(str(self.invokeai_db))
-            cursor = conn.cursor()
-
-            # Try exact source URL match
-            cursor.execute("SELECT path FROM models WHERE source = ?", (url,))
-            result = cursor.fetchone()
-
-            if not result:
-                # Try filename pattern match
-                filename = Path(urlparse(url).path).name
-                cursor.execute("SELECT path FROM models WHERE source LIKE ?", (f"%/{filename}",))
-                result = cursor.fetchone()
-
-            conn.close()
-
-            if result:
-                relative_path = result[0]
-                full_path = self.invokeai_models_dir / relative_path
-                if full_path.exists():
-                    return str(full_path)
-            return None
-
-        except Exception as e:
-            logging.error(f"Error querying InvokeAI database: {e}")
-            return None
-
-    def create_symlink(self, source_path: str, target_path: str) -> tuple[bool, str]:
-        """Create symlink from source to target"""
-        try:
-            target = Path(target_path).resolve()
-            source = Path(source_path).resolve()
-
-            if not source.exists():
-                return False, f"Source file does not exist: {source_path}"
-
-            target.parent.mkdir(parents=True, exist_ok=True)
-
-            if target.exists() or target.is_symlink():
-                target.unlink()
-
-            target.symlink_to(source)
-
-            if target.is_symlink() and target.exists():
-                return True, "Symlink created successfully"
-            else:
-                return False, f"Symlink verification failed for {target_path}"
-
-        except Exception as e:
-            return False, f"Symlink creation failed: {str(e)}"
+        return find_in_invokeai(self.invokeai_db, self.invokeai_models_dir,
+                                self.hash_index, url, sha256_hash=sha256_hash)
 
     def determine_output_path(self, url: str, url_type: str) -> str:
         """Determine the correct output path based on file type and URL"""
@@ -550,7 +361,7 @@ class ModelDownloader:
 
             for url_type, url, output_path in urls:
                 if url.startswith('http'):
-                    repo_id, filename = self.parse_hf_url(url)
+                    repo_id, filename = parse_hf_url(url)
                     if repo_id and filename:
                         cache_key = f"{repo_id}/{filename}"
                         url_to_cache_key[url] = cache_key
@@ -587,7 +398,7 @@ class ModelDownloader:
 
                 repo_batches = {}
                 for item, cache_key, url in cache_misses:
-                    repo_id, filename = self.parse_hf_url(url)
+                    repo_id, filename = parse_hf_url(url)
                     if repo_id and filename:
                         if repo_id not in repo_batches:
                             repo_batches[repo_id] = []
@@ -654,9 +465,9 @@ class ModelDownloader:
                 cache_key = url_to_cache_key.get(item['url'])
                 sha256_hash = sha256_by_key.get(cache_key) if cache_key else None
 
-                invokeai_path = self.find_in_invokeai(item['url'], sha256_hash=sha256_hash)
+                invokeai_path = self._find_in_invokeai(item['url'], sha256_hash=sha256_hash)
                 if invokeai_path:
-                    success, msg = self.create_symlink(invokeai_path, str(output_path))
+                    success, msg = create_symlink(invokeai_path, str(output_path))
                     if success:
                         item['status'] = 'Linked'
 
@@ -665,7 +476,7 @@ class ModelDownloader:
     def download_hf_file(self, url: str, output_path: str, item: Dict, progress_callback=None) -> tuple[bool, str]:
         """Download file from HuggingFace"""
         try:
-            repo_id, filename = self.parse_hf_url(url)
+            repo_id, filename = parse_hf_url(url)
             if not repo_id or not filename:
                 return False, f"Failed to parse URL: {url}"
 
@@ -732,7 +543,7 @@ class ModelDownloader:
             if not Path(cached_file).exists():
                 return False, f"HuggingFace returned non-existent file: {cached_file}"
 
-            success, msg = self.create_symlink(cached_file, output_path)
+            success, msg = create_symlink(cached_file, output_path)
             if success:
                 return True, "Success"
             else:
@@ -743,45 +554,6 @@ class ModelDownloader:
 
 
 # Queue Management Functions
-def init_queue_table():
-    """Initialize the download queue table if it doesn't exist"""
-    conn = sqlite3.connect(QUEUE_DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS download_queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT NOT NULL,
-            output_path TEXT NOT NULL,
-            filename TEXT NOT NULL,
-            config_name TEXT,
-            remote_size INTEGER,
-            hub_source_path TEXT,
-            status TEXT DEFAULT 'pending',
-            progress INTEGER DEFAULT 0,
-            speed_mbps REAL DEFAULT 0,
-            error_message TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            started_at TIMESTAMP,
-            completed_at TIMESTAMP
-        )
-    ''')
-
-    # Migration: add hub_source_path column if it doesn't exist
-    cursor.execute("PRAGMA table_info(download_queue)")
-    columns = [row[1] for row in cursor.fetchall()]
-    if 'hub_source_path' not in columns:
-        cursor.execute("ALTER TABLE download_queue ADD COLUMN hub_source_path TEXT")
-
-    cursor.execute('''
-        CREATE INDEX IF NOT EXISTS idx_queue_status
-        ON download_queue(status)
-    ''')
-
-    conn.commit()
-    conn.close()
-
-
 def add_to_queue(items: List[Dict]) -> int:
     """Add items to the download queue"""
     init_queue_table()
@@ -973,7 +745,7 @@ def get_item_source(downloader, item) -> str:
         return "link"
 
     if downloader.invokeai_enabled and item['url'].startswith('http'):
-        invokeai_path = downloader.find_in_invokeai(item['url'])
+        invokeai_path = downloader._find_in_invokeai(item['url'])
         if invokeai_path:
             return "link"
 
@@ -1358,7 +1130,7 @@ def queue_hub_models() -> int:
                 sha256_hash = cache_result['data'].get('hash')
 
         # Find matching model in InvokeAI hub via hash or URL
-        invokeai_path = downloader.find_in_invokeai(item['url'], sha256_hash=sha256_hash)
+        invokeai_path = downloader._find_in_invokeai(item['url'], sha256_hash=sha256_hash)
 
         if invokeai_path:
             # Add to queue with hub path - processor will create symlink
