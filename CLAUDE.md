@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-WanGP Smart Model Downloader - Downloads AI models from HuggingFace for Wan2GP video generation. Uses SHA256 hash matching to avoid duplicate downloads by creating symlinks to existing files in a local model hub (InvokeAI).
+WanGP Smart Model Downloader - Downloads AI models from HuggingFace for Wan2GP video generation. Uses SHA256 hash matching to avoid duplicate downloads by creating symlinks to existing files in a local model hub (HubRoot).
 
 ## Commands
 
@@ -25,16 +25,12 @@ uv run streamlit run downloader_st.py
 uv run python hfqueue.py
 uv run python hfqueue.py --status
 uv run python hfqueue.py --clear
-
-# Hash index (CLI)
-uv run python hash_index.py --status    # Show hash index stats
-uv run python hash_index.py --rebuild   # Rebuild from scratch
 ```
 
 ## Architecture
 
 ```
-User → Streamlit UI → SQLite queue → hfqueue.py → HuggingFace/InvokeAI → symlink
+User → Streamlit UI → SQLite queue → hfqueue.py → HuggingFace/HubRoot → symlink
 ```
 
 **Two-process design**: Streamlit handles UI/selection, `hfqueue.py` handles downloads independently. Communication via SQLite `download_queue` table in `hfcache.db`.
@@ -45,7 +41,7 @@ The Streamlit UI adds jobs to the queue; the queue processor polls for `pending`
 
 `pending` → `downloading` → `complete` | `linked` | `failed`
 
-- **linked**: Model found in InvokeAI hub, symlinked without downloading
+- **linked**: Model found in HubRoot, symlinked without downloading
 - **complete**: Downloaded from HuggingFace and symlinked from HF cache
 - Queue processor resets stale `downloading` jobs to `pending` on startup
 
@@ -53,55 +49,50 @@ The Streamlit UI adds jobs to the queue; the queue processor polls for `pending`
 
 | File | Purpose |
 |------|---------|
-| `shared.py` | Shared utilities: bandwidth limiting, URL parsing, symlink creation, InvokeAI lookup, config loading, queue table init |
+| `shared.py` | Shared utilities: bandwidth limiting, URL parsing, symlink creation, HubRoot lookup, config loading, queue table init |
 | `downloader_st.py` | Streamlit web UI, `ModelDownloader` class, queue management functions |
 | `hfqueue.py` | Standalone download processor with progress bars (runs as separate process) |
-| `hash_index.py` | SHA256 index for InvokeAI models (`HashIndex` class) |
 | `downloader.py` | Legacy Textual TUI (not queue-based, pre-dates Streamlit version) |
 
-`shared.py` contains all code shared between `downloader_st.py` and `hfqueue.py`: `QUEUE_DB_PATH`, `BandwidthLimited*` classes, `parse_hf_url()`, `create_symlink()`, `find_in_invokeai()`, `load_config()`, and `init_queue_table()`.
+`shared.py` contains all code shared between `downloader_st.py` and `hfqueue.py`: `QUEUE_DB_PATH`, `BandwidthLimited*` classes, `parse_hf_url()`, `create_symlink()`, `find_in_hub()`, `load_config()`, and `init_queue_table()`.
 
 ### Model Resolution Priority
 
-1. **SHA256 hash match** - HuggingFace LFS OID → `hash_sha256.db` lookup
-2. **URL exact match** - Source URL in InvokeAI's `models.source` column
-3. **Filename match** - Last resort pattern matching
-4. **Download** - If nothing found, download from HuggingFace
+1. **SHA256 hash match** - HuggingFace LFS OID → HubRoot `hash_sha256` column lookup
+2. **Filename match** - Fallback pattern matching against HubRoot `filename` column
+3. **Download** - If nothing found, download from HuggingFace
+
+### HubRoot Integration
+
+HubRoot stores models at `{hub_models_dir}/{blake3_hash}/{filename}`. The database (`hubrootv3.db`) has a `models` table with `hash_sha256`, `hash_blake3`, `filename`, and `deleted` columns. SHA256 hashes are pre-populated for all models, eliminating the need for a separate hash index.
 
 ### Database Files
 
 | File | Tables | Purpose |
 |------|--------|---------|
 | `hfcache.db` | `hf_file_cache`, `download_queue` | HF metadata cache + job queue |
-| `hash_sha256.db` | `hash_index` | SHA256→file path mapping for InvokeAI |
 
-Both DBs are SQLite with schema migrations handled inline (PRAGMA table_info checks).
+Schema migrations handled inline (PRAGMA table_info checks).
 
 ### Configuration
 
 `config.yaml` keys:
 - `wan2gp_directory`: Path to Wan2GP (reads `defaults/*.json` for model URLs)
 - `bandwidth_limit_kb`: Download speed limit (KB/s)
-- `invokeai_db`: Path to InvokeAI's `invokeai.db`
-- `invokeai_models_dir`: Path to InvokeAI's models directory
-- `parallel_hash_workers`: Threads for SHA256 computation (default: 8)
+- `hub_db`: Path to HubRoot's `hubrootv3.db`
+- `hub_models_dir`: Path to HubRoot's models directory
 
 ### Key Classes
 
 **`ModelDownloader`** (`downloader_st.py`):
-- `build_download_queue()`: Three-pass process: (1) collect URLs from `defaults/*.json`, (2) batch-fetch file sizes from HF API with caching, (3) check InvokeAI and auto-create symlinks
-- `find_in_invokeai()`: Multi-strategy model lookup (hash → URL → filename)
+- `build_download_queue()`: Three-pass process: (1) collect URLs from `defaults/*.json`, (2) batch-fetch file sizes from HF API with caching, (3) check HubRoot and auto-create symlinks
+- `_find_in_hub()`: Delegates to `shared.find_in_hub()` (SHA256 → filename lookup)
 - `resolve_config_urls()`: Handles recursive JSON references (URLs can be strings pointing to other config files)
 
 **`QueueProcessor`** (`hfqueue.py`):
 - `get_next_job()`: FIFO from `download_queue` table (oldest pending first)
-- `process_job()`: Check `hub_source_path` first, then InvokeAI lookup, then download
+- `process_job()`: Check `hub_source_path` first, then HubRoot lookup, then download
 - `download_file()`: Threaded HF download with `.incomplete` file progress polling
-
-**`HashIndex`** (`hash_index.py`):
-- `sync_from_invokeai()`: Import models from InvokeAI DB, remove deleted entries
-- `compute_pending_hashes()`: Parallel SHA256 via `ThreadPoolExecutor`, skips multifile (directory) models
-- `lookup_by_sha256()`: Fast hash-to-path lookup
 
 ### HIGH/LOW Model Pairing
 
@@ -110,5 +101,5 @@ Models with both high-precision (bf16/fp16) and quantized (quanto) variants are 
 ### Streamlit UI Structure
 
 - **Models tab**: Builds queue from `defaults/*.json`, groups HIGH/LOW pairs, supports multi-row selection via `st.dataframe`. Filter and "Show All" toggle in sidebar.
-- **Queue tab**: Shows download queue with auto-refresh. "Queue Hub" button batch-adds InvokeAI-available models. Processor start/stop controls.
-- Session state stores: `downloader`, `download_queue`, `selected_items`, `hash_index_ready`
+- **Queue tab**: Shows download queue with auto-refresh. "Queue Hub" button batch-adds HubRoot-available models. Processor start/stop controls.
+- Session state stores: `downloader`, `download_queue`, `selected_items`

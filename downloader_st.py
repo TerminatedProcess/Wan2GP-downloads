@@ -22,10 +22,9 @@ import streamlit as st
 import pandas as pd
 from huggingface_hub import hf_hub_download, HfApi
 
-from hash_index import HashIndex
 from shared import (
     QUEUE_DB_PATH, BandwidthLimitedSession, BandwidthLimitedTransport,
-    parse_hf_url, create_symlink, find_in_invokeai, load_config, init_queue_table,
+    parse_hf_url, create_symlink, find_in_hub, load_config, init_queue_table,
 )
 
 try:
@@ -49,7 +48,7 @@ logging.basicConfig(
 
 
 class ModelDownloader:
-    def __init__(self, hub_dir: str = None, bandwidth_limit: Optional[int] = None, cache_dir: str = None, config_file: str = "config.yaml"):
+    def __init__(self, bandwidth_limit: Optional[int] = None, cache_dir: str = None, config_file: str = "config.yaml"):
         self.config = load_config(config_file)
 
         self.wan2gp_dir = Path(self.config.get("wan2gp_directory", "../Wan2GP-mryan"))
@@ -57,31 +56,16 @@ class ModelDownloader:
         self.defaults_dir = self.wan2gp_dir / "defaults"
         self.bandwidth_limit = bandwidth_limit if bandwidth_limit is not None else self.config.get("bandwidth_limit_kb")
 
-        # InvokeAI integration
-        self.invokeai_db = Path(self.config.get("invokeai_db", "")) if self.config.get("invokeai_db") else None
-        self.invokeai_models_dir = Path(self.config.get("invokeai_models_dir", "")) if self.config.get("invokeai_models_dir") else None
-        self.invokeai_enabled = (
-            self.invokeai_db is not None and
-            self.invokeai_db.exists() and
-            self.invokeai_models_dir is not None and
-            self.invokeai_models_dir.exists()
+        # HubRoot integration
+        self.hub_db = Path(self.config.get("hub_db", "")) if self.config.get("hub_db") else None
+        self.hub_models_dir = Path(self.config.get("hub_models_dir", "")) if self.config.get("hub_models_dir") else None
+        self.hub_enabled = (
+            self.hub_db is not None and
+            self.hub_db.exists() and
+            self.hub_models_dir is not None and
+            self.hub_models_dir.exists()
         )
 
-        # SHA256 hash index for InvokeAI models
-        self.parallel_hash_workers = self.config.get("parallel_hash_workers", 8)
-        self.hash_index = None
-        if self.invokeai_enabled:
-            self.hash_index = HashIndex(
-                str(self.invokeai_db),
-                str(self.invokeai_models_dir),
-                self.parallel_hash_workers
-            )
-
-        # Legacy hub support
-        self.hub_dir = Path(hub_dir) if hub_dir else None
-        self.hub_enabled = self.hub_dir is not None and self.hub_dir.exists() and self.hub_dir.is_dir()
-
-        self.hash_db = {}
         self.download_queue = []
         self.hf_api = HfApi()
         self.cache_db_path = "hfcache.db"
@@ -245,12 +229,12 @@ class ModelDownloader:
 
         return None
 
-    def _find_in_invokeai(self, url: str, sha256_hash: str = None) -> Optional[str]:
-        """Find model in InvokeAI database. Delegates to shared.find_in_invokeai."""
-        if not self.invokeai_enabled:
+    def _find_in_hub(self, url: str, sha256_hash: str = None) -> Optional[str]:
+        """Find model in HubRoot database. Delegates to shared.find_in_hub."""
+        if not self.hub_enabled:
             return None
-        return find_in_invokeai(self.invokeai_db, self.invokeai_models_dir,
-                                self.hash_index, url, sha256_hash=sha256_hash)
+        return find_in_hub(self.hub_db, self.hub_models_dir,
+                           url, sha256_hash=sha256_hash)
 
     def determine_output_path(self, url: str, url_type: str) -> str:
         """Determine the correct output path based on file type and URL"""
@@ -428,8 +412,8 @@ class ModelDownloader:
                             progress_callback(processed, total_misses)
                             self.cache_file_info(cache_key, repo_id, filename, None, str(e))
 
-        # Third pass: check InvokeAI and create symlinks
-        if self.invokeai_enabled:
+        # Third pass: check hub and create symlinks
+        if self.hub_enabled:
             # Get all SHA256 hashes from cache in one query
             all_cache_keys = list(url_to_cache_key.values()) if url_to_cache_key else []
             sha256_by_key = {}
@@ -465,9 +449,9 @@ class ModelDownloader:
                 cache_key = url_to_cache_key.get(item['url'])
                 sha256_hash = sha256_by_key.get(cache_key) if cache_key else None
 
-                invokeai_path = self._find_in_invokeai(item['url'], sha256_hash=sha256_hash)
-                if invokeai_path:
-                    success, msg = create_symlink(invokeai_path, str(output_path))
+                hub_path = self._find_in_hub(item['url'], sha256_hash=sha256_hash)
+                if hub_path:
+                    success, msg = create_symlink(hub_path, str(output_path))
                     if success:
                         item['status'] = 'Linked'
 
@@ -744,9 +728,9 @@ def get_item_source(downloader, item) -> str:
     if output_path.exists() and output_path.is_symlink():
         return "link"
 
-    if downloader.invokeai_enabled and item['url'].startswith('http'):
-        invokeai_path = downloader._find_in_invokeai(item['url'])
-        if invokeai_path:
+    if downloader.hub_enabled and item['url'].startswith('http'):
+        hub_path = downloader._find_in_hub(item['url'])
+        if hub_path:
             return "link"
 
     return "download"
@@ -1096,11 +1080,11 @@ def render_queue_status():
 
 def queue_hub_models() -> int:
     """
-    Queue models that exist in InvokeAI hub for symlinking.
+    Queue models that exist in HubRoot for symlinking.
 
     For each model in the download queue:
     1. Look up SHA256 hash from cached HuggingFace metadata (LFS OID)
-    2. Find matching file in InvokeAI via hash_index lookup
+    2. Find matching file in HubRoot via SHA256 or filename lookup
     3. If found, add to download queue with hub_source_path set
 
     The queue processor will handle deleting existing files and creating symlinks.
@@ -1109,7 +1093,7 @@ def queue_hub_models() -> int:
     """
     downloader = st.session_state.downloader
 
-    if not downloader.invokeai_enabled:
+    if not downloader.hub_enabled:
         return 0
 
     queue_items = []
@@ -1121,7 +1105,7 @@ def queue_hub_models() -> int:
         output_path = Path(item['output_path'])
 
         # Look up SHA256 hash from cached HuggingFace API response
-        repo_id, filename = downloader.parse_hf_url(item['url'])
+        repo_id, filename = parse_hf_url(item['url'])
         sha256_hash = None
         if repo_id and filename:
             cache_key = f"{repo_id}/{filename}"
@@ -1129,10 +1113,10 @@ def queue_hub_models() -> int:
             if cache_result['found'] and cache_result['data']:
                 sha256_hash = cache_result['data'].get('hash')
 
-        # Find matching model in InvokeAI hub via hash or URL
-        invokeai_path = downloader._find_in_invokeai(item['url'], sha256_hash=sha256_hash)
+        # Find matching model in HubRoot via hash or filename
+        hub_path = downloader._find_in_hub(item['url'], sha256_hash=sha256_hash)
 
-        if invokeai_path:
+        if hub_path:
             # Add to queue with hub path - processor will create symlink
             queue_items.append({
                 'url': item['url'],
@@ -1140,7 +1124,7 @@ def queue_hub_models() -> int:
                 'filename': item['filename'],
                 'config': item.get('config', ''),
                 'remote_size': item.get('remote_size'),
-                'hub_source_path': invokeai_path
+                'hub_source_path': hub_path
             })
 
     if queue_items:
@@ -1217,43 +1201,12 @@ def main():
     # Initialize session state
     if 'downloader' not in st.session_state:
         st.session_state.downloader = ModelDownloader(config_file="config.yaml")
-        st.session_state.hash_index_ready = False
         st.session_state.selected_items = set()
         st.session_state.download_queue = []
 
     downloader = st.session_state.downloader
 
-    # Initialize hash index if InvokeAI is enabled
-    if downloader.hash_index and not st.session_state.get('hash_index_ready', False):
-        hash_index = downloader.hash_index
-
-        # Sync from InvokeAI database
-        with st.spinner("Syncing hash index from InvokeAI..."):
-            added = hash_index.sync_from_invokeai()
-
-        stats = hash_index.get_stats()
-
-        if stats['pending'] > 0:
-            # Show progress UI for hash computation
-            st.info(f"Computing SHA256 hashes for {stats['pending']} models. This is required for accurate model matching.")
-            progress_bar = st.progress(0, text="Computing SHA256 hashes...")
-            status_text = st.empty()
-
-            def hash_progress_callback(current, total, filename):
-                pct = current / total if total > 0 else 0
-                progress_bar.progress(pct, text=f"Hashing {current}/{total}")
-                status_text.caption(f"Current: {filename[:60]}...")
-
-            # Compute hashes
-            hash_index.compute_pending_hashes(progress_callback=hash_progress_callback)
-
-            progress_bar.empty()
-            status_text.empty()
-            st.success(f"Hash index ready! {stats['total']} models indexed.")
-
-        st.session_state.hash_index_ready = True
-
-    # Build download queue after hash index is ready
+    # Build download queue
     if not st.session_state.download_queue:
         with st.spinner("Building download queue..."):
             st.session_state.download_queue = downloader.build_download_queue()
@@ -1305,39 +1258,6 @@ def main():
 
             st.success("Cache cleared!")
             st.rerun()
-
-        # Hash index status
-        if downloader.hash_index:
-            st.divider()
-            st.markdown("**SHA256 Hash Index**")
-            hash_stats = downloader.hash_index.get_stats()
-            if hash_stats['exists']:
-                st.caption(f"Models: {hash_stats['total']} | Pending: {hash_stats['pending']}")
-                if hash_stats['pending'] > 0:
-                    st.warning(f"{hash_stats['pending']} hashes pending")
-            else:
-                st.caption("Not initialized")
-
-            if st.button("🔄 Rebuild Hash Index", width="stretch"):
-                from hash_index import rebuild_index
-                with st.spinner("Rebuilding hash index..."):
-                    progress_bar = st.progress(0, text="Computing SHA256 hashes...")
-
-                    def hash_rebuild_callback(current, total, filename):
-                        pct = current / total if total > 0 else 0
-                        progress_bar.progress(pct, text=f"Hashing {current}/{total}")
-
-                    rebuild_index(
-                        str(downloader.invokeai_db),
-                        str(downloader.invokeai_models_dir),
-                        downloader.parallel_hash_workers,
-                        hash_rebuild_callback
-                    )
-                    progress_bar.empty()
-
-                st.success("Hash index rebuilt!")
-                st.session_state.hash_index_ready = True
-                st.rerun()
 
         # Queue stats at bottom
         stats = get_queue_stats()

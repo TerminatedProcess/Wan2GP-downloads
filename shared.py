@@ -157,68 +157,67 @@ def create_symlink(source_path: str, target_path: str, verbose: bool = False) ->
         return False, f"Symlink creation failed: {str(e)}"
 
 
-def find_in_invokeai(invokeai_db: Path, invokeai_models_dir: Path,
-                     hash_index, url: str, sha256_hash: str = None,
-                     verbose: bool = False) -> Optional[str]:
-    """Find model in InvokeAI database by SHA256 hash, source URL, or filename.
+def find_in_hub(hub_db: Path, hub_models_dir: Path,
+                url: str, sha256_hash: str = None,
+                verbose: bool = False) -> Optional[str]:
+    """Find model in HubRoot database by SHA256 hash or filename.
+
+    HubRoot stores models at: {hub_models_dir}/{blake3_hash}/{filename}
 
     Priority:
-    1. SHA256 hash lookup (most reliable, hash-based matching)
-    2. Source URL exact match (legacy fallback)
-    3. Filename pattern match (last resort)
+    1. SHA256 hash lookup (most reliable - matches HuggingFace LFS OID)
+    2. Filename match (fallback)
 
     Args:
-        invokeai_db: Path to InvokeAI's invokeai.db
-        invokeai_models_dir: Path to InvokeAI's models directory
-        hash_index: HashIndex instance (or None)
+        hub_db: Path to HubRoot's hubrootv3.db
+        hub_models_dir: Path to HubRoot's models directory
         url: HuggingFace URL of the model
         sha256_hash: Optional SHA256 hash for lookup
         verbose: If True, print debug info to console
     """
-    # Priority 1: SHA256 hash lookup via hash index
-    if sha256_hash and hash_index:
-        try:
-            if hasattr(hash_index, 'is_ready') and not hash_index.is_ready():
-                pass  # Skip if index not ready
-            else:
-                result = hash_index.lookup_by_sha256(sha256_hash)
-                if result:
-                    file_path = Path(result['file_path'])
-                    if file_path.exists():
-                        logging.info(f"Found model via SHA256: {file_path.name}")
-                        return str(file_path)
-        except Exception:
-            pass
-
-    # Priority 2 & 3: URL and filename fallback
     try:
-        conn = sqlite3.connect(str(invokeai_db))
+        conn = sqlite3.connect(str(hub_db))
         cursor = conn.cursor()
 
-        # Try exact source URL match
-        cursor.execute("SELECT path FROM models WHERE source = ?", (url,))
-        result = cursor.fetchone()
+        result = None
 
-        if not result:
-            # Try filename pattern match
-            filename = Path(urlparse(url).path).name
-            cursor.execute("SELECT path FROM models WHERE source LIKE ?", (f"%/{filename}",))
+        # Priority 1: SHA256 hash lookup
+        if sha256_hash:
+            cursor.execute(
+                "SELECT hash_blake3, filename FROM models WHERE hash_sha256 = ? AND deleted = 0",
+                (sha256_hash,)
+            )
             result = cursor.fetchone()
+            if result and verbose:
+                print(f"  Found via SHA256: {result[1]}")
+
+        # Priority 2: Filename match
+        if not result:
+            filename = Path(urlparse(url).path).name
+            cursor.execute(
+                "SELECT hash_blake3, filename FROM models WHERE filename = ? AND deleted = 0",
+                (filename,)
+            )
+            result = cursor.fetchone()
+            if result and verbose:
+                print(f"  Found via filename: {result[1]}")
 
         conn.close()
 
         if result:
-            relative_path = result[0]
-            full_path = invokeai_models_dir / relative_path
+            blake3_hash, hub_filename = result
+            full_path = hub_models_dir / blake3_hash / hub_filename
             if full_path.exists():
+                logging.info(f"Found model in hub: {hub_filename}")
                 return str(full_path)
+
         return None
 
     except Exception as e:
         if verbose:
-            print(f"  Error querying InvokeAI database: {e}")
+            print(f"  Error querying hub database: {e}")
         else:
-            logging.error(f"Error querying InvokeAI database: {e}")
+            logging.error(f"Error querying hub database: {e}")
         return None
 
 

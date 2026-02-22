@@ -8,7 +8,7 @@ alias queue='uv run python hfqueue.py'
 alias qs='uv run python hfqueue.py --status'
 alias hfq='python hfqueue.py'
 alias hfk='pkill -f hfqueue.py'
-alias stop='pkill -f "streamlit run" 2>/dev/null || true'
+alias stop='pkill -f "streamlit run" 2>/dev/null || true;sleep 3;exit'
 
 # Function to perform minimal install of comfy
 function install

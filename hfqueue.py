@@ -17,7 +17,7 @@ from typing import Optional, Dict, List
 from huggingface_hub import hf_hub_download, HfApi
 
 from shared import (
-    QUEUE_DB_PATH, parse_hf_url, create_symlink, find_in_invokeai,
+    QUEUE_DB_PATH, parse_hf_url, create_symlink, find_in_hub,
     load_config, init_queue_table,
 )
 
@@ -36,28 +36,15 @@ class QueueProcessor:
         self.cache_dir = self.wan2gp_dir / "ckpts"
         self.bandwidth_limit = self.config.get("bandwidth_limit_kb", 90000)
 
-        # InvokeAI integration
-        self.invokeai_db = Path(self.config.get("invokeai_db", "")) if self.config.get("invokeai_db") else None
-        self.invokeai_models_dir = Path(self.config.get("invokeai_models_dir", "")) if self.config.get("invokeai_models_dir") else None
-        self.invokeai_enabled = (
-            self.invokeai_db is not None and
-            self.invokeai_db.exists() and
-            self.invokeai_models_dir is not None and
-            self.invokeai_models_dir.exists()
+        # HubRoot integration
+        self.hub_db = Path(self.config.get("hub_db", "")) if self.config.get("hub_db") else None
+        self.hub_models_dir = Path(self.config.get("hub_models_dir", "")) if self.config.get("hub_models_dir") else None
+        self.hub_enabled = (
+            self.hub_db is not None and
+            self.hub_db.exists() and
+            self.hub_models_dir is not None and
+            self.hub_models_dir.exists()
         )
-
-        # Hash index for SHA256 lookups
-        self.hash_index = None
-        if self.invokeai_enabled:
-            try:
-                from hash_index import HashIndex
-                self.hash_index = HashIndex(
-                    str(self.invokeai_db),
-                    str(self.invokeai_models_dir),
-                    self.config.get("parallel_hash_workers", 8)
-                )
-            except ImportError:
-                pass
 
         # HuggingFace API
         self.hf_api = HfApi()
@@ -146,13 +133,13 @@ class QueueProcessor:
         conn.commit()
         conn.close()
 
-    def _find_in_invokeai(self, url: str, sha256_hash: str = None) -> Optional[str]:
-        """Find model in InvokeAI database. Delegates to shared.find_in_invokeai."""
-        if not self.invokeai_enabled:
+    def _find_in_hub(self, url: str, sha256_hash: str = None) -> Optional[str]:
+        """Find model in HubRoot database. Delegates to shared.find_in_hub."""
+        if not self.hub_enabled:
             return None
-        return find_in_invokeai(self.invokeai_db, self.invokeai_models_dir,
-                                self.hash_index, url, sha256_hash=sha256_hash,
-                                verbose=True)
+        return find_in_hub(self.hub_db, self.hub_models_dir,
+                           url, sha256_hash=sha256_hash,
+                           verbose=True)
 
     def download_file(self, job: Dict) -> tuple:
         """Download a file from HuggingFace with progress tracking"""
@@ -268,7 +255,7 @@ class QueueProcessor:
         """Process a single download job.
 
         Logic:
-        1. Check if model is available in InvokeAI hub (via hub_source_path or lookup)
+        1. Check if model is available in HubRoot (via hub_source_path or lookup)
         2. If available in hub AND destination file/symlink exists → delete it
         3. Create symlink from hub
         4. If not in hub → download from HuggingFace
@@ -297,9 +284,9 @@ class QueueProcessor:
                 print(f"  WARNING: Hub path no longer exists, will search...")
                 hub_path = None
 
-        if not hub_path and self.invokeai_enabled:
-            print("  Checking InvokeAI hub...")
-            hub_path = self._find_in_invokeai(job['url'])
+        if not hub_path and self.hub_enabled:
+            print("  Checking HubRoot...")
+            hub_path = self._find_in_hub(job['url'])
 
         if hub_path:
             # Model available in hub - delete existing and create symlink
@@ -363,10 +350,10 @@ class QueueProcessor:
         print(f"Config: {self.config.get('wan2gp_directory', '../Wan2GP-mryan')}")
         print(f"Bandwidth limit: {self.bandwidth_limit} KB/s ({self.bandwidth_limit/1024:.0f} MB/s)")
         print(f"Poll interval: {self.poll_interval} seconds")
-        if self.invokeai_enabled:
-            print(f"InvokeAI Hub: ✓ Enabled (models linked from hub skip download)")
+        if self.hub_enabled:
+            print(f"HubRoot: ✓ Enabled (models linked from hub skip download)")
         else:
-            print(f"InvokeAI Hub: ✗ Disabled")
+            print(f"HubRoot: ✗ Disabled")
         print("-" * 60)
 
         # Reset any interrupted downloads from previous runs

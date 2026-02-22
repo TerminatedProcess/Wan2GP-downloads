@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source:*)",
+      "Bash(python:*)",
+      "Bash(printf '\\e[?1000l\\e[?1002l\\e[?1003l\\e[?1006l')",
+      "Bash(clear)",
+      "Bash(timeout:*)",
+      "Bash(printf '\\033[?1000l\\033[?1002l\\033[?1003l\\033[?1006l')",
+      "WebSearch",
+      "Bash(uv pip show:*)",
+      "Bash(sqlite3:*)",
+      "Bash(xargs -I{} sh -c 'echo \"\"=== {} ===\"\" && cat \"\"{}\"\"')",
+      "Bash(uv pip install:*)",
+      "Bash(uv run streamlit:*)",
+      "Bash(pkill:*)",
+      "Bash(uv run python:*)",
+      "Bash(tr:*)"
+    ],
+    "deny": [],
+    "ask": [],
+    "additionalDirectories": [
+      "/home/dev/work/media/WanDev/Wan2GP-mryan"
+    ]
+  }
+}
