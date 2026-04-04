@@ -24,7 +24,8 @@ from huggingface_hub import hf_hub_download, HfApi
 
 from shared import (
     QUEUE_DB_PATH, BandwidthLimitedSession, BandwidthLimitedTransport,
-    parse_hf_url, create_symlink, find_in_hub, load_config, init_queue_table,
+    parse_hf_url, create_symlink, find_in_hub, load_config, save_config_value,
+    init_queue_table, update_supplemental_models,
 )
 
 try:
@@ -236,7 +237,7 @@ class ModelDownloader:
         return find_in_hub(self.hub_db, self.hub_models_dir,
                            url, sha256_hash=sha256_hash)
 
-    def determine_output_path(self, url: str, url_type: str) -> str:
+    def determine_output_path(self, url: str, url_type: str, text_encoder_folder: str = '') -> str:
         """Determine the correct output path based on file type and URL"""
         filename = Path(urlparse(url).path).name
         base = str(self.wan2gp_dir)
@@ -254,6 +255,17 @@ class ModelDownloader:
                 return f"{base}/loras_qwen/{filename}"
             else:
                 return f"{base}/loras/{filename}"
+        elif url_type == "TEXT_ENC":
+            # Text encoder folder from config, or extract from URL path
+            folder = text_encoder_folder
+            if not folder:
+                # URL like .../resolve/main/mistral3small/file.safetensors
+                url_parts = urlparse(url).path.split('/')
+                if len(url_parts) >= 2:
+                    folder = url_parts[-2]
+            if folder and folder != 'main':
+                return f"{base}/ckpts/{folder}/{filename}"
+            return f"{base}/ckpts/{filename}"
         else:
             return f"{base}/ckpts/{filename}"
 
@@ -289,6 +301,10 @@ class ModelDownloader:
             resolved_urls = resolve_urls(raw_urls)
             resolved_preload_urls = resolve_urls(preload_urls) if isinstance(preload_urls, list) else []
 
+            text_encoder_urls = model_data.get('text_encoder_URLs', [])
+            text_encoder_folder = model_data.get('text_encoder_folder', '')
+            resolved_te_urls = resolve_urls(text_encoder_urls) if isinstance(text_encoder_urls, list) else []
+
             results = []
 
             for url in resolved_urls:
@@ -300,6 +316,11 @@ class ModelDownloader:
                 if url.startswith('http'):
                     output_path = self.determine_output_path(url, "PRELOAD")
                     results.append(("PRELOAD", url, output_path))
+
+            for url in resolved_te_urls:
+                if url.startswith('http'):
+                    output_path = self.determine_output_path(url, "TEXT_ENC", text_encoder_folder=text_encoder_folder)
+                    results.append(("TEXT_ENC", url, output_path))
 
             return results
 
@@ -360,6 +381,40 @@ class ModelDownloader:
                     'progress': 0,
                     'remote_size': None
                 })
+
+        # Scan handler files and update supplemental_models table
+        json_urls = {item['url'] for item in queue}
+        update_supplemental_models(self.wan2gp_dir, existing_urls=json_urls)
+
+        # Load supplemental models from database
+        try:
+            conn = sqlite3.connect(self.cache_db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT config_name, url, url_type, text_encoder_folder
+                FROM supplemental_models
+            ''')
+            for config_name, url, url_type, te_folder in cursor.fetchall():
+                if url.startswith('http'):
+                    repo_id, filename = parse_hf_url(url)
+                    if repo_id and filename:
+                        cache_key = f"{repo_id}/{filename}"
+                        url_to_cache_key[url] = cache_key
+
+                    output_path = self.determine_output_path(url, url_type, text_encoder_folder=te_folder or '')
+                    queue.append({
+                        'config': config_name,
+                        'type': url_type,
+                        'url': url,
+                        'output_path': output_path,
+                        'filename': Path(output_path).name,
+                        'status': '---',
+                        'progress': 0,
+                        'remote_size': None
+                    })
+            conn.close()
+        except Exception as e:
+            logging.error(f"Error loading supplemental models: {e}")
 
         # Second pass: batch lookup file sizes
         if url_to_cache_key:
@@ -1229,12 +1284,17 @@ def main():
 
         st.divider()
 
-        # Bandwidth limit (shown in sidebar for reference)
-        st.markdown("**Bandwidth Limit**")
-        current_limit_kb = downloader.bandwidth_limit if downloader.bandwidth_limit else 90000
-        current_limit_mb = current_limit_kb / 1024
-        st.caption(f"Current: {current_limit_mb:.0f} MB/s (~{current_limit_mb * 8:.0f} Mbps)")
-        st.caption("Edit config.yaml to change")
+        # Bandwidth limit slider
+        max_limit_kb = downloader.bandwidth_limit if downloader.bandwidth_limit else 90000
+        saved_pct = downloader.config.get('bandwidth_pct', 100)
+        bw_pct = st.slider("Bandwidth Limit", 0, 100, saved_pct, step=5,
+                           format="%d%%", key="bw_slider")
+        effective_kb = int(max_limit_kb * bw_pct / 100)
+        effective_mb = effective_kb / 1024
+        st.caption(f"{effective_mb:.0f} MB/s of {max_limit_kb/1024:.0f} MB/s max")
+        if bw_pct != saved_pct:
+            save_config_value("config.yaml", "bandwidth_pct", bw_pct)
+            downloader.config['bandwidth_pct'] = bw_pct
 
         st.divider()
 

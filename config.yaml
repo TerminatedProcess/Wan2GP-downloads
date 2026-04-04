@@ -12,3 +12,5 @@ bandwidth_limit_kb: 30000
 # Models stored at: {hub_models_dir}/{blake3_hash}/{filename}
 hub_db: /mnt/llm/hub/hubmodels/hubrootv3.db
 hub_models_dir: /mnt/llm/hub/hubmodels/models
+
+bandwidth_pct: 75

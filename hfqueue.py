@@ -14,10 +14,22 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List
 
+import httpx
 from huggingface_hub import hf_hub_download, HfApi
 
+try:
+    from huggingface_hub import set_client_factory
+except ImportError:
+    try:
+        from huggingface_hub import configure_http_backend
+        set_client_factory = None
+    except ImportError:
+        set_client_factory = None
+        configure_http_backend = None
+
 from shared import (
-    QUEUE_DB_PATH, parse_hf_url, create_symlink, find_in_hub,
+    QUEUE_DB_PATH, BandwidthLimitedTransport, BandwidthLimitedSession,
+    parse_hf_url, create_symlink, find_in_hub,
     load_config, init_queue_table,
 )
 
@@ -32,9 +44,10 @@ class QueueProcessor:
         self.current_job_id = None
 
         # Paths from config
+        self.config_file = config_file
         self.wan2gp_dir = Path(self.config.get("wan2gp_directory", "../Wan2GP-mryan"))
         self.cache_dir = self.wan2gp_dir / "ckpts"
-        self.bandwidth_limit = self.config.get("bandwidth_limit_kb", 90000)
+        self.bandwidth_limit_kb = self.config.get("bandwidth_limit_kb", 90000)
 
         # HubRoot integration
         self.hub_db = Path(self.config.get("hub_db", "")) if self.config.get("hub_db") else None
@@ -52,6 +65,30 @@ class QueueProcessor:
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def get_effective_bandwidth(self) -> int:
+        """Get effective bandwidth limit in KB/s, re-reading bandwidth_pct from config."""
+        config = load_config(self.config_file, create_if_missing=False)
+        pct = config.get('bandwidth_pct', 100)
+        return int(self.bandwidth_limit_kb * pct / 100)
+
+    def _apply_bandwidth_limit(self):
+        """Configure hf_hub_download's HTTP backend with current bandwidth limit."""
+        effective_kb = self.get_effective_bandwidth()
+        max_bytes = effective_kb * 1024 if effective_kb > 0 else None
+        effective_mb = effective_kb / 1024
+        pct = load_config(self.config_file, create_if_missing=False).get('bandwidth_pct', 100)
+        print(f"  Bandwidth: {effective_mb:.0f} MB/s ({pct}%)")
+
+        if max_bytes and set_client_factory is not None:
+            def create_httpx_client():
+                transport = BandwidthLimitedTransport(max_bytes_per_second=max_bytes)
+                return httpx.Client(transport=transport)
+            set_client_factory(create_httpx_client)
+        elif max_bytes and configure_http_backend is not None:
+            def create_session():
+                return BandwidthLimitedSession(max_bytes_per_second=max_bytes)
+            configure_http_backend(backend_factory=create_session)
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully"""
@@ -305,6 +342,8 @@ class QueueProcessor:
                 print(f"  Symlink failed: {message}, falling back to download...")
 
         # Not in hub or symlink failed - proceed with download
+        # Apply bandwidth limit (re-read percentage from config each job)
+        self._apply_bandwidth_limit()
         self.update_job_status(job_id, 'downloading', 0, 0)
 
         success, message = self.download_file(job)
@@ -348,7 +387,9 @@ class QueueProcessor:
         print("HuggingFace Download Queue Processor")
         print("=" * 60)
         print(f"Config: {self.config.get('wan2gp_directory', '../Wan2GP-mryan')}")
-        print(f"Bandwidth limit: {self.bandwidth_limit} KB/s ({self.bandwidth_limit/1024:.0f} MB/s)")
+        effective = self.get_effective_bandwidth()
+        pct = self.config.get('bandwidth_pct', 100)
+        print(f"Bandwidth limit: {effective} KB/s ({effective/1024:.0f} MB/s) [{pct}% of {self.bandwidth_limit_kb/1024:.0f} MB/s]")
         print(f"Poll interval: {self.poll_interval} seconds")
         if self.hub_enabled:
             print(f"HubRoot: ✓ Enabled (models linked from hub skip download)")

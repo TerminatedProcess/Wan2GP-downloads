@@ -4,13 +4,15 @@ Shared utilities for WanGP Model Downloader.
 Used by both downloader_st.py (Streamlit UI) and hfqueue.py (queue processor).
 """
 
+import ast
 import json
 import yaml
 import time
 import sqlite3
 import logging
+import posixpath
 from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 from urllib.parse import urlparse
 
 import requests
@@ -250,6 +252,37 @@ def load_config(config_file: str, create_if_missing: bool = True) -> dict:
         return DEFAULT_CONFIG.copy()
 
 
+def save_config_value(config_file: str, key: str, value):
+    """Update a single key in the config file, preserving comments and other keys."""
+    config = load_config(config_file, create_if_missing=False)
+    config[key] = value
+    try:
+        config_path = Path(config_file)
+        with open(config_path, 'r') as f:
+            lines = f.readlines()
+
+        # Try to update the key in-place to preserve comments
+        updated = False
+        for i, line in enumerate(lines):
+            stripped = line.lstrip()
+            if stripped.startswith(f'{key}:'):
+                indent = line[:len(line) - len(stripped)]
+                lines[i] = f'{indent}{key}: {value}\n'
+                updated = True
+                break
+
+        if updated:
+            with open(config_path, 'w') as f:
+                f.writelines(lines)
+        else:
+            # Key doesn't exist yet, append it
+            with open(config_path, 'a') as f:
+                f.write(f'\n{key}: {value}\n')
+
+    except Exception as e:
+        logging.error(f"Error saving config value: {e}")
+
+
 def init_queue_table():
     """Initialize the download queue table if it doesn't exist"""
     conn = sqlite3.connect(QUEUE_DB_PATH)
@@ -285,5 +318,225 @@ def init_queue_table():
         ON download_queue(status)
     ''')
 
+    # Supplemental models table - for models not in defaults/*.json
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS supplemental_models (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            config_name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            url_type TEXT DEFAULT 'MAIN',
+            text_encoder_folder TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(url)
+        )
+    ''')
+
     conn.commit()
     conn.close()
+
+
+def _extract_urls_from_list(list_node: ast.List, local_vars: Dict[str, str]) -> List[Tuple[str, str]]:
+    """Extract (url, text_encoder_folder) tuples from an AST List of build_hf_url() calls."""
+    results = []
+    for elt in list_node.elts:
+        if not isinstance(elt, ast.Call):
+            continue
+        if not (isinstance(elt.func, ast.Name) and elt.func.id == "build_hf_url"):
+            continue
+
+        args = []
+        for arg in elt.args:
+            val = _resolve_ast_value(arg, local_vars)
+            if val is None:
+                break
+            args.append(val)
+        else:
+            if len(args) >= 2:
+                repo_id = args[0]
+                path = posixpath.join(*args[1:])
+                url = f"https://huggingface.co/{repo_id}/resolve/main/{path}"
+                te_folder = args[1] if len(args) >= 3 else ""
+                results.append((url, te_folder))
+    return results
+
+
+def scan_handler_text_encoders(wan2gp_dir: Path) -> List[Dict]:
+    """Scan Wan2GP handler .py files for text_encoder_URLs built via build_hf_url().
+
+    Uses AST parsing to extract build_hf_url() calls from:
+    1. Direct assignments: extra_model_def["text_encoder_URLs"] = [...]
+    2. Dict literals: { "text_encoder_URLs": [...], ... }
+
+    Resolves variable references (text_encoder_folder, text_encoder_repo) from nearby
+    string assignments in the same function scope.
+
+    Returns list of dicts with keys: config_name, url, text_encoder_folder
+    """
+    models_dir = wan2gp_dir / "models"
+    if not models_dir.exists():
+        return []
+
+    results = []
+    handler_files = list(models_dir.rglob("*_handler.py"))
+
+    for handler_file in handler_files:
+        try:
+            source = handler_file.read_text()
+            tree = ast.parse(source)
+        except Exception:
+            continue
+
+        config_name = handler_file.stem.replace("_handler", "")
+
+        # Also collect module-level string constants for variable resolution
+        # Two passes: first plain strings, then f-strings that reference them
+        module_vars = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and hasattr(node, 'lineno'):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                        module_vars[target.id] = node.value.value
+        # Second pass: resolve f-strings using already-collected vars
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and hasattr(node, 'lineno'):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and isinstance(node.value, ast.JoinedStr):
+                        resolved = _resolve_ast_value(node.value, module_vars)
+                        if resolved:
+                            module_vars[target.id] = resolved
+
+        for node in ast.walk(tree):
+            te_list_node = None
+            lineno = getattr(node, 'lineno', 0)
+
+            # Pattern 1: extra_model_def["text_encoder_URLs"] = [...]
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.List):
+                for target in node.targets:
+                    if isinstance(target, ast.Subscript):
+                        if (isinstance(target.slice, ast.Constant) and
+                                target.slice.value == "text_encoder_URLs"):
+                            te_list_node = node.value
+                    elif isinstance(target, ast.Name) and "text_encoder" in target.id.lower():
+                        te_list_node = node.value
+
+            # Pattern 2: dict literal with "text_encoder_URLs" key
+            if isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values):
+                    if (isinstance(key, ast.Constant) and key.value == "text_encoder_URLs"
+                            and isinstance(value, ast.List)):
+                        te_list_node = value
+                        break
+
+            if te_list_node is None:
+                continue
+
+            # Merge module-level vars with local vars (local takes precedence)
+            local_vars = dict(module_vars)
+            local_vars.update(_collect_local_vars(source, lineno))
+
+            for url, te_folder in _extract_urls_from_list(te_list_node, local_vars):
+                results.append({
+                    'config_name': config_name,
+                    'url': url,
+                    'text_encoder_folder': te_folder,
+                })
+
+    return results
+
+
+def _collect_local_vars(source: str, target_lineno: int) -> Dict[str, str]:
+    """Collect string variable assignments closest to target_lineno (before it)."""
+    # Collect all string assignments with their line numbers
+    candidates: Dict[str, List[Tuple[int, str]]] = {}
+    try:
+        tree = ast.parse(source)
+    except Exception:
+        return {}
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not hasattr(node, 'lineno'):
+            continue
+        # Only look at assignments before the target within 30 lines
+        if node.lineno > target_lineno or node.lineno < target_lineno - 30:
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                name = target.id
+                if name not in candidates:
+                    candidates[name] = []
+                candidates[name].append((node.lineno, node.value.value))
+
+    # For each variable, pick the assignment closest to (but before) target_lineno
+    local_vars = {}
+    for name, assignments in candidates.items():
+        closest = max(assignments, key=lambda x: x[0])
+        local_vars[name] = closest[1]
+
+    return local_vars
+
+
+def _resolve_ast_value(node: ast.expr, local_vars: Dict[str, str]) -> Optional[str]:
+    """Resolve an AST node to a string value."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in local_vars:
+        return local_vars[node.id]
+    # Handle f-strings like f"{_GEMMA_FOLDER}.safetensors"
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            elif isinstance(value, ast.FormattedValue):
+                resolved = _resolve_ast_value(value.value, local_vars)
+                if resolved is None:
+                    return None
+                parts.append(resolved)
+            else:
+                return None
+        return "".join(parts)
+    return None
+
+
+def update_supplemental_models(wan2gp_dir: Path, existing_urls: set = None) -> int:
+    """Scan handlers and rebuild supplemental_models table.
+
+    Clears and repopulates on every call so dropped models don't linger.
+
+    Args:
+        wan2gp_dir: Path to Wan2GP directory
+        existing_urls: URLs already known from defaults/*.json (to avoid duplicates)
+
+    Returns: number of models in table after scan
+    """
+    scanned = scan_handler_text_encoders(wan2gp_dir)
+
+    conn = sqlite3.connect(QUEUE_DB_PATH)
+    cursor = conn.cursor()
+
+    # Clear and rebuild — keeps table in sync with current handler code
+    cursor.execute("DELETE FROM supplemental_models")
+
+    added = 0
+    for item in scanned:
+        url = item['url']
+        # Skip if already in defaults JSON configs
+        if existing_urls and url in existing_urls:
+            continue
+
+        try:
+            cursor.execute('''
+                INSERT OR IGNORE INTO supplemental_models
+                (config_name, url, url_type, text_encoder_folder)
+                VALUES (?, ?, 'TEXT_ENC', ?)
+            ''', (item['config_name'], url, item['text_encoder_folder']))
+            if cursor.rowcount > 0:
+                added += 1
+        except Exception:
+            pass
+
+    conn.commit()
+    conn.close()
+    return added
