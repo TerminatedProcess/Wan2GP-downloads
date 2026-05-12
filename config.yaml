@@ -13,4 +13,4 @@ bandwidth_limit_kb: 30000
 hub_db: /mnt/llm/hub/hubmodels/hubrootv3.db
 hub_models_dir: /mnt/llm/hub/hubmodels/models
 
-bandwidth_pct: 75
+bandwidth_pct: 85
