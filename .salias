@@ -3,12 +3,16 @@ set -gx ENV_NAME '.venv'
 alias pip='uv pip'
 alias rmenv='rmd $ENV_NAME .envrc down_env hfcache.db __pycache__; exit'
 alias mkenv='mkuv $ENV_NAME 3.12.10'
-alias run='kk;wandown;uv run streamlit run downloader_st.py'
+# Port pinned to the PortHub lease (8505). Unpinned, streamlit grabs the next
+# free port and squats whatever service owns it (it took image-to-prompt's 8504).
+alias run='kk;wandown;uv run streamlit run downloader_st.py --server.port 8505'
+alias svcrun='systemctl --user restart wangp-downloader.service'
+alias svcstop='systemctl --user stop wangp-downloader.service'
 alias queue='uv run python hfqueue.py'
 alias qs='uv run python hfqueue.py --status'
 alias hfq='python hfqueue.py'
 alias hfk='pkill -f hfqueue.py'
-alias stop='pkill -f "streamlit run" 2>/dev/null || true;sleep 3;exit'
+alias stop='pkill -f "streamlit run downloader_st.py" 2>/dev/null || true;sleep 3;exit'
 
 # Function to perform minimal install of comfy
 function install

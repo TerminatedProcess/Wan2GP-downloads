@@ -27,6 +27,24 @@ uv run python hfqueue.py --status
 uv run python hfqueue.py --clear
 ```
 
+## Service
+
+The UI runs as a systemd user service, registered in PortHub and grouped under
+**Media Stack** on the Service Dashboard (http://localhost:8090).
+
+| Layer | Value |
+|-------|-------|
+| Unit | `~/.config/systemd/user/wangp-downloader.service` (Manual Start — not enabled at boot) |
+| URL | http://localhost:8505 |
+| Lease | `8505 wangp-downloader` in `~/.config/porthub/leases.sh` |
+| Group | `media-stack` in `~/.config/porthub_service_dash/groups.json` |
+
+`svcrun` / `svcstop` control the service; `run` still launches a foreground
+instance (same port, so it will refuse to start while the service is up).
+
+The queue processor (`hfqueue.py`) is deliberately **not** a service — the UI
+starts and stops it, and a systemd unit would fight the UI's `pkill`.
+
 ## Architecture
 
 ```

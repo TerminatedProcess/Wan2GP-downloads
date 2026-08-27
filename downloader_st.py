@@ -696,26 +696,51 @@ def clear_queue(status_filter: str = None):
         else:
             cursor.execute("DELETE FROM download_queue WHERE status = ?", (status_filter,))
     else:
-        cursor.execute("DELETE FROM download_queue")
+        # Keep the in-flight row: the processor cannot be told to abandon a
+        # download, so deleting it leaves a busy processor with no visible job
+        cursor.execute("DELETE FROM download_queue WHERE status != 'downloading'")
 
     conn.commit()
     conn.close()
 
 
 def remove_queue_item(item_id: int):
-    """Remove a specific item from the queue"""
+    """Remove a specific item from the queue (in-flight downloads are kept)"""
     conn = sqlite3.connect(QUEUE_DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM download_queue WHERE id = ?", (item_id,))
+    cursor.execute(
+        "DELETE FROM download_queue WHERE id = ? AND status != 'downloading'",
+        (item_id,)
+    )
     conn.commit()
     conn.close()
+
+
+def reset_downloading_jobs() -> int:
+    """Put any 'downloading' jobs back to pending (after killing the processor)"""
+    conn = sqlite3.connect(QUEUE_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE download_queue
+        SET status = 'pending', progress = 0, speed_mbps = 0
+        WHERE status = 'downloading'
+    ''')
+    count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return count
+
+
+# Matches the python process itself, not shells/editors that merely mention
+# hfqueue.py on their command line (those made the UI report a phantom "Running")
+PROCESSOR_PATTERN = r'python[0-9.]*[[:space:]]+[^[:space:]]*hfqueue\.py'
 
 
 def is_queue_processor_running() -> bool:
     """Check if hfqueue processor is running"""
     try:
         result = subprocess.run(
-            ['pgrep', '-f', 'hfqueue.py'],
+            ['pgrep', '-f', PROCESSOR_PATTERN],
             capture_output=True,
             text=True
         )
@@ -745,15 +770,38 @@ def start_queue_processor() -> bool:
         return False
 
 
-def stop_queue_processor() -> bool:
-    """Stop the queue processor"""
+def stop_queue_processor(timeout: float = 3.0) -> bool:
+    """Stop the queue processor.
+
+    SIGTERM only flips the processor's `running` flag - an in-flight
+    hf_hub_download runs to completion first, so the process survives and the
+    UI flips straight back to "Running". Escalate to SIGKILL, then confirm.
+    """
     try:
         result = subprocess.run(
-            ['pkill', '-f', 'hfqueue.py'],
+            ['pkill', '-f', PROCESSOR_PATTERN],
             capture_output=True,
             text=True
         )
-        return result.returncode == 0
+        if result.returncode != 0:
+            # Nothing matched - already stopped
+            return not is_queue_processor_running()
+
+        deadline = time.time() + timeout
+        while time.time() < deadline and is_queue_processor_running():
+            time.sleep(0.25)
+
+        if is_queue_processor_running():
+            subprocess.run(['pkill', '-9', '-f', PROCESSOR_PATTERN],
+                           capture_output=True, text=True)
+            time.sleep(0.5)
+
+        if is_queue_processor_running():
+            return False
+
+        # A killed job leaves its row stuck on 'downloading'
+        reset_downloading_jobs()
+        return True
     except Exception:
         return False
 
