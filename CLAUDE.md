@@ -84,6 +84,28 @@ The Streamlit UI adds jobs to the queue; the queue processor polls for `pending`
 
 HubRoot stores models at `{hub_models_dir}/{blake3_hash}/{filename}`. The database (`hubrootv3.db`) has a `models` table with `hash_sha256`, `hash_blake3`, `filename`, and `deleted` columns. SHA256 hashes are pre-populated for all models, eliminating the need for a separate hash index.
 
+### Storage Layout
+
+`hfqueue.py` hardcodes its HF cache to `{wan2gp_directory}/ckpts`, so downloads
+land in Wan2GP's own model dir — **not** the default `~/.cache/huggingface`.
+
+That `ckpts` dir now lives on `/mnt/llm` and is symlinked back into place:
+
+```
+/home/dev/work/services/Wan2GP-mryan/ckpts
+    -> /mnt/llm/unsloth/huggingface/wan2gp-ckpts
+```
+
+This matches the existing `~/.cache/huggingface -> /mnt/llm/unsloth/huggingface`
+pattern. It exists because `/home` is a 100%-full btrfs volume with ~19
+snapshots; ~20 GB models written there both exhausted it and got pinned by
+snapshot retention. A 19.6 GiB download failed with an opaque
+`Internal Writer Error: Background writer channel closed` from the Rust hf_xet
+backend, which is what ENOSPC looks like from that layer.
+
+HubRoot (`/mnt/llm/hub/hubmodels`) is a *source* for symlinks only — a HubRoot
+miss always falls through to a real download into `ckpts`.
+
 ### Database Files
 
 | File | Tables | Purpose |

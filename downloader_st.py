@@ -736,6 +736,27 @@ def reset_downloading_jobs() -> int:
 PROCESSOR_PATTERN = r'python[0-9.]*[[:space:]]+[^[:space:]]*hfqueue\.py'
 
 
+def retry_failed_jobs() -> int:
+    """Requeue failed jobs so the processor picks them up again.
+
+    'Clear Failed' only deletes the row, and get_next_job() selects
+    WHERE status = 'pending' - so a failed job was previously unrecoverable
+    from the UI and had to be re-added from the Models tab.
+    """
+    conn = sqlite3.connect(QUEUE_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE download_queue
+        SET status = 'pending', progress = 0, speed_mbps = 0,
+            error_message = NULL, started_at = NULL, completed_at = NULL
+        WHERE status = 'failed'
+    ''')
+    count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return count
+
+
 def is_queue_processor_running() -> bool:
     """Check if hfqueue processor is running"""
     try:
@@ -756,14 +777,27 @@ def start_queue_processor() -> bool:
         script_dir = Path(__file__).parent.absolute()
         hfqueue_path = script_dir / "hfqueue.py"
 
-        # Start as detached process
-        subprocess.Popen(
-            ['python', str(hfqueue_path)],
+        # sys.executable, NOT bare 'python': under systemd the service PATH is
+        # /usr/local/bin:/usr/bin, so 'python' resolves to the system
+        # interpreter, which has no huggingface_hub. The child died instantly
+        # with ModuleNotFoundError while Popen still "succeeded".
+        err_log = open(script_dir / "hfqueue.log", "ab")
+        proc = subprocess.Popen(
+            [sys.executable, str(hfqueue_path)],
             cwd=str(script_dir),
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=err_log,
             start_new_session=True  # Detach from parent process
         )
+
+        # Confirm it survived import time instead of trusting Popen
+        time.sleep(1.5)
+        if proc.poll() is not None:
+            logging.error(
+                f"Queue processor exited immediately (rc={proc.returncode}); "
+                f"see hfqueue.log"
+            )
+            return False
         return True
     except Exception as e:
         logging.error(f"Failed to start queue processor: {e}")
@@ -1248,25 +1282,30 @@ def render_queue_tab():
             st.toast(f"Queued {queued} hub models")
 
     with col2:
+        if st.button("Retry Failed", width="stretch", key="retry_failed"):
+            requeued = retry_failed_jobs()
+            if requeued:
+                st.toast(f"Requeued {requeued} failed job(s)")
+            else:
+                st.toast("No failed jobs to retry")
+
+    with col3:
         if st.button("Clear Complete", width="stretch", key="clear_complete"):
             clear_queue('complete')
             st.toast("Cleared completed items")
 
-    with col3:
+    with col4:
         if st.button("Clear Failed", width="stretch", key="clear_failed"):
             clear_queue('failed')
             st.toast("Cleared failed items")
 
-    with col4:
+    with col5:
         if st.button("Clear All", width="stretch", key="clear_all_queue"):
             clear_queue()
             st.toast("Cleared all queue items")
 
-    with col5:
-        st.caption("Auto-refresh: 3s")
-
     with col6:
-        st.write("")
+        st.caption("Auto-refresh: 3s")
 
     st.divider()
 

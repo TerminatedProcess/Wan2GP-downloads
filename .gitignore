@@ -4,3 +4,4 @@ downloader.log
 hfcache.db
 hash_sha256.db
 .venv/
+hfqueue.log
