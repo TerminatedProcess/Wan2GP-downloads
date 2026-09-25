@@ -1,7 +1,7 @@
 # WanGP Model Downloader Configuration
 
 # Path to Wan2GP installation (where defaults/ and ckpts/ are located)
-wan2gp_directory: ../Wan2GP-mryan
+wan2gp_directory: ../Wan2GP
 
 # Bandwidth limit in KB/s (90000 = ~90 MB/s)
 # Set to null or 0 for unlimited
